@@ -1,35 +1,21 @@
+# fft_tools.py
 import numpy as np
-import matplotlib.pyplot as plt
 
-def plot_fft(samples, fs):
+def windowed_centered(samples):
     x = samples.astype(float)
     x -= np.mean(x)
-    x *= np.hanning(len(x))
+    win = np.hanning(len(x))
+    return x * win
 
-    N = len(x)
-    fft_vals = np.fft.rfft(x)
-    fft_mag = np.abs(fft_vals) * 2 / N
+def compute_fft_spectrum(samples, fs):
+    x_win = windowed_centered(samples)
+    N = len(x_win)
+    fft_vals = np.fft.rfft(x_win)
+    fft_mag = np.abs(fft_vals) * 2.0 / N
     freqs = np.fft.rfftfreq(N, 1.0 / fs)
+    return freqs, fft_mag, fft_vals
 
-    plt.figure(figsize=(8,4))
-    plt.plot(freqs, fft_mag)
-    plt.title("FFT")
-    plt.xlabel("Frequency (Hz)")
-    plt.ylabel("Magnitude")
-    plt.grid(True)
-    plt.show()
-
-    idx = np.argmax(fft_mag[1:]) + 1
-    print(f"Dominant freq: {freqs[idx]:.2f} Hz (amp {fft_mag[idx]:.2f})")
-
-def fft_bin_at_freq(samples, fs, target_freq):
-    x = samples.astype(float)
-    x -= np.mean(x)
-    x *= np.hanning(len(x))
-
-    N = len(x)
-    fft_vals = np.fft.rfft(x)
-    freqs = np.fft.rfftfreq(N, 1.0 / fs)
-
+def fft_mag_at_freq(samples, fs, target_freq):
+    freqs, fft_mag, _ = compute_fft_spectrum(samples, fs)
     idx = np.argmin(np.abs(freqs - target_freq))
-    return fft_vals[idx], freqs[idx]
+    return fft_mag[idx], freqs[idx]

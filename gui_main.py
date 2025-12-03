@@ -1,3 +1,4 @@
+# gui_main.py
 import sys
 import struct
 import numpy as np
@@ -15,17 +16,14 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt
 
-# ---- your own modules ----
-from commands import *
+from commands import *               # FS, command IDs
 from serial_comm import send_command
 from adc_stream import read_adc_frame
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
+from scan_kundt import scan_kundt    # <-- use shared backend scan
 
 
-# -------------------------------------------------
-# Serial manager helper
-# -------------------------------------------------
 class SerialManager:
     def __init__(self):
         self.ser = None
@@ -44,9 +42,6 @@ class SerialManager:
         return self.ser is not None and self.ser.is_open
 
 
-# -------------------------------------------------
-# Matplotlib canvas widget
-# -------------------------------------------------
 class MplCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=3, dpi=100):
         fig = Figure(figsize=(width, height), dpi=dpi)
@@ -55,20 +50,16 @@ class MplCanvas(FigureCanvas):
         self.setParent(parent)
 
 
-# -------------------------------------------------
-# Main Window
-# -------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Kundt Tube Controller GUI")
         self.serial_mgr = SerialManager()
-        self.last_samples = None  # store last ADC frame
+        self.last_samples = None
 
         self._build_ui()
 
-    # ------------- UI BUILD ----------------
     def _build_ui(self):
         central = QWidget()
         main_layout = QVBoxLayout(central)
@@ -91,7 +82,6 @@ class MainWindow(QMainWindow):
         conn_layout.addWidget(self.connect_btn)
         conn_layout.addWidget(self.disconnect_btn)
         conn_group.setLayout(conn_layout)
-
         main_layout.addWidget(conn_group)
 
         # Tabs
@@ -100,24 +90,20 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_signal_tab(), "Signal / ADC / FFT")
         tabs.addTab(self._build_kundt_tab(), "Kundt Scan")
         tabs.addTab(self._build_gain_tab(), "Gain (Digipot)")
-
         main_layout.addWidget(tabs)
 
         self.setCentralWidget(central)
 
-    # ------------- Motor tab ----------------
+    # ---------------- Motor tab ----------------
     def _build_motor_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
-
         grid = QGridLayout()
 
-        # Toggle dir
         btn_toggle_dir = QPushButton("Toggle Direction")
         btn_toggle_dir.clicked.connect(self.on_toggle_dir)
         grid.addWidget(btn_toggle_dir, 0, 0)
 
-        # Set dir
         btn_set_dir_0 = QPushButton("Set DIR = 0")
         btn_set_dir_1 = QPushButton("Set DIR = 1")
         btn_set_dir_0.clicked.connect(lambda: self.on_set_dir(0))
@@ -125,7 +111,6 @@ class MainWindow(QMainWindow):
         grid.addWidget(btn_set_dir_0, 0, 1)
         grid.addWidget(btn_set_dir_1, 0, 2)
 
-        # Move mm
         self.move_spin = QDoubleSpinBox()
         self.move_spin.setRange(-1000.0, 1000.0)
         self.move_spin.setDecimals(3)
@@ -136,14 +121,12 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.move_spin, 1, 1)
         grid.addWidget(btn_move, 1, 2)
 
-        # Read switch
         btn_read_sw = QPushButton("Read End Switch")
         btn_read_sw.clicked.connect(self.on_read_switch)
         self.switch_label = QLabel("Switch: ?")
         grid.addWidget(btn_read_sw, 2, 0)
         grid.addWidget(self.switch_label, 2, 1, 1, 2)
 
-        # Home
         btn_home = QPushButton("Home Motor")
         btn_home.clicked.connect(self.on_home)
         grid.addWidget(btn_home, 3, 0)
@@ -152,51 +135,51 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return w
 
-    # ------------- Signal / ADC / FFT tab -------------
+    # ---------------- Signal / ADC / FFT tab ----------------
     def _build_signal_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        # AD9833 frequency
         freq_group = QGroupBox("Signal Generator (AD9833)")
         fg_layout = QHBoxLayout()
         self.freq_spin = QDoubleSpinBox()
         self.freq_spin.setRange(0.0, 12_000_000.0)
         self.freq_spin.setDecimals(2)
         self.freq_spin.setValue(1000.0)
+
         btn_set_freq = QPushButton("Set Frequency (Hz)")
         btn_set_freq.clicked.connect(self.on_set_freq)
+
+        btn_mute = QPushButton("Mute")
+        btn_mute.clicked.connect(self.on_mute)
+
         fg_layout.addWidget(QLabel("Frequency (Hz):"))
         fg_layout.addWidget(self.freq_spin)
         fg_layout.addWidget(btn_set_freq)
+        fg_layout.addWidget(btn_mute)
+        
         freq_group.setLayout(fg_layout)
-
         layout.addWidget(freq_group)
 
-        # ADC controls
         adc_group = QGroupBox("ADC / Capture")
         adc_layout = QHBoxLayout()
         btn_capture = QPushButton("Capture Frame")
         btn_capture.clicked.connect(self.on_capture_frame)
         adc_layout.addWidget(btn_capture)
         adc_group.setLayout(adc_layout)
-
         layout.addWidget(adc_group)
 
-        # Plots
         self.time_canvas = MplCanvas(self, width=5, height=3)
         self.fft_canvas = MplCanvas(self, width=5, height=3)
 
         layout.addWidget(QLabel("Time-domain signal"))
         layout.addWidget(self.time_canvas)
-
         layout.addWidget(QLabel("FFT magnitude"))
         layout.addWidget(self.fft_canvas)
-
         layout.addStretch()
         return w
 
-    # ------------- Kundt scan tab -------------
+    # ---------------- Kundt scan tab ----------------
     def _build_kundt_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -223,18 +206,22 @@ class MainWindow(QMainWindow):
         form.addRow("End (mm):", self.scan_end_spin)
         form.addRow("Step (mm):", self.scan_step_spin)
 
+        layout.addLayout(form)
+
         btn_run_scan = QPushButton("Run Scan")
         btn_run_scan.clicked.connect(self.on_run_scan)
+        layout.addWidget(btn_run_scan)
+
+        self.kundt_canvas = MplCanvas(self, width=5, height=3)
+        layout.addWidget(self.kundt_canvas)
 
         self.scan_result_label = QLabel("Results: -")
-
-        layout.addLayout(form)
-        layout.addWidget(btn_run_scan)
         layout.addWidget(self.scan_result_label)
+
         layout.addStretch()
         return w
 
-    # ------------- Gain tab -------------
+    # ---------------- Gain tab ----------------
     def _build_gain_tab(self):
         w = QWidget()
         layout = QVBoxLayout(w)
@@ -251,14 +238,14 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return w
 
-    # ----------------- Helpers -----------------
+    # ---------------- Helpers ----------------
     def ensure_connected(self):
         if not self.serial_mgr.is_connected():
             QMessageBox.warning(self, "Not connected", "Please connect to the serial port first.")
             return False
         return True
 
-    # ----------------- Slots -------------------
+    # ---------------- Slots ----------------
     def on_connect(self):
         port = self.port_edit.text().strip()
         try:
@@ -266,7 +253,6 @@ class MainWindow(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Error", "Invalid baud rate.")
             return
-
         try:
             self.serial_mgr.connect(port, baud)
             QMessageBox.information(self, "Connected", f"Connected to {port} at {baud} baud.")
@@ -277,7 +263,6 @@ class MainWindow(QMainWindow):
         self.serial_mgr.disconnect()
         QMessageBox.information(self, "Disconnected", "Serial port closed.")
 
-    # Motor / Switch
     def on_toggle_dir(self):
         if not self.ensure_connected(): return
         status, _ = send_command(self.serial_mgr.ser, CMD_TOGGLE_DIR)
@@ -296,7 +281,6 @@ class MainWindow(QMainWindow):
         if status is None:
             QMessageBox.warning(self, "Move", "No response from MCU.")
             return
-
         if not wait_until_move_complete(self.serial_mgr.ser):
             QMessageBox.warning(self, "Move", "Move timeout!")
         else:
@@ -316,13 +300,11 @@ class MainWindow(QMainWindow):
         if status != STS_ACK:
             QMessageBox.warning(self, "Home", "Home command failed to start.")
             return
-
         if not wait_until_home_complete(self.serial_mgr.ser):
             QMessageBox.warning(self, "Home", "Homing timeout.")
         else:
             QMessageBox.information(self, "Home", "Homing complete.")
 
-    # Signal / ADC
     def on_set_freq(self):
         if not self.ensure_connected(): return
         f_hz = float(self.freq_spin.value())
@@ -333,11 +315,21 @@ class MainWindow(QMainWindow):
             self, "AD9833",
             "Frequency set OK." if status == STS_ACK else f"Set failed (status {status})"
         )
+    def on_mute(self):
+        if not self.ensure_connected():
+            return
+
+        # Send 0 Hz to AD9833
+        payload = struct.pack("<f", 0.0)
+        status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+
+        if status == STS_ACK:
+            QMessageBox.information(self, "Speaker Mute", "Speaker muted (frequency = 0 Hz).")
+        else:
+            QMessageBox.warning(self, "Speaker Mute", f"Failed to mute. Status={status}")
 
     def on_capture_frame(self):
         if not self.ensure_connected(): return
-
-        # start + read one frame + stop
         send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
         samples = read_adc_frame(self.serial_mgr.ser)
         send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
@@ -363,16 +355,13 @@ class MainWindow(QMainWindow):
     def _update_fft_plot(self, samples):
         ax = self.fft_canvas.ax
         ax.clear()
-
         x = samples.astype(float)
         x -= np.mean(x)
         x *= np.hanning(len(x))
-
         N = len(x)
         fft_vals = np.fft.rfft(x)
         fft_mag = np.abs(fft_vals) * 2 / N
         freqs = np.fft.rfftfreq(N, 1.0 / FS)
-
         ax.plot(freqs, fft_mag)
         ax.set_xlim(0, FS/2)
         ax.set_title("FFT magnitude")
@@ -381,13 +370,11 @@ class MainWindow(QMainWindow):
         ax.grid(True)
         self.fft_canvas.draw()
 
-    # Gain tab
     def on_set_gain(self):
         if not self.ensure_connected(): return
         v = int(self.gain_spin.value())
         digipot_set(self.serial_mgr.ser, v)
 
-    # Kundt scan
     def on_run_scan(self):
         if not self.ensure_connected(): return
 
@@ -396,59 +383,20 @@ class MainWindow(QMainWindow):
         end_mm = float(self.scan_end_spin.value())
         step_mm = float(self.scan_step_spin.value())
 
-        if step_mm <= 0 or end_mm <= start_mm:
-            QMessageBox.warning(self, "Scan", "Check start/end/step values.")
+        try:
+            positions, mag_arr, res = scan_kundt(
+                self.serial_mgr.ser, f_hz, start_mm, end_mm, step_mm
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Scan error", str(e))
             return
 
-        # Homing
-        send_command(self.serial_mgr.ser, CMD_HOME)
-        if not wait_until_home_complete(self.serial_mgr.ser):
-            QMessageBox.warning(self, "Scan", "Homing timeout.")
-            return
-
-        # Move to start
-        send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", start_mm))
-        if not wait_until_move_complete(self.serial_mgr.ser):
-            QMessageBox.warning(self, "Scan", "Move-to-start timeout.")
-            return
-
-        positions = []
-        magnitudes = []
-
-        x = start_mm
-        while x <= end_mm + 1e-9:
-            positions.append(x)
-
-            # Capture frame
-            send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
-            samples = read_adc_frame(self.serial_mgr.ser)
-            send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
-
-            if samples is None:
-                QMessageBox.warning(self, "Scan", "ADC error during scan.")
-                return
-
-            # FFT at excitation frequency
-            mag = self._fft_mag_at_freq(samples, f_hz)
-            magnitudes.append(mag)
-
-            # Next position
-            x += step_mm
-            if x > end_mm:
-                break
-            send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", x))
-            if not wait_until_move_complete(self.serial_mgr.ser):
-                QMessageBox.warning(self, "Scan", "Move timeout during scan.")
-                return
-
-        # Compute Pmax/Pmin and |R|
-        mag_arr = np.array(magnitudes)
-        idx_max = np.argmax(mag_arr)
-        idx_min = np.argmin(mag_arr)
-        p_max = mag_arr[idx_max]
-        p_min = mag_arr[idx_min]
-        SWR = p_max / p_min
-        R_mag = (SWR - 1) / (SWR + 1)
+        p_max = res["p_max"]
+        p_min = res["p_min"]
+        idx_max = res["idx_max"]
+        idx_min = res["idx_min"]
+        SWR = res["SWR"]
+        R_mag = res["R_mag"]
 
         self.scan_result_label.setText(
             f"p_max={p_max:.3f} at {positions[idx_max]:.2f} mm, "
@@ -456,22 +404,27 @@ class MainWindow(QMainWindow):
             f"SWR={SWR:.3f}, |R|={R_mag:.3f}"
         )
 
-    def _fft_mag_at_freq(self, samples, target_freq):
-        x = samples.astype(float)
-        x -= np.mean(x)
-        x *= np.hanning(len(x))
+        # Plot standing wave
+        ax = self.kundt_canvas.ax
+        ax.clear()
+        ax.plot(positions, mag_arr, label="|P| raw")
 
-        N = len(x)
-        fft_vals = np.fft.rfft(x)
-        freqs = np.fft.rfftfreq(N, 1.0 / FS)
+        # optional smoothing
+        if len(mag_arr) >= 5:
+            mag_s = np.convolve(mag_arr, np.ones(5)/5, mode='same')
+            ax.plot(positions, mag_s, '--', label="|P| smoothed")
 
-        idx = np.argmin(np.abs(freqs - target_freq))
-        return np.abs(fft_vals[idx]) * 2 / N
+        ax.scatter([positions[idx_max]], [p_max], label="p_max")
+        ax.scatter([positions[idx_min]], [p_min], label="p_min")
+
+        ax.set_title("Standing Wave |P| vs Position")
+        ax.set_xlabel("Position (mm)")
+        ax.set_ylabel("Amplitude |P|")
+        ax.grid(True)
+        ax.legend()
+        self.kundt_canvas.draw()
 
 
-# -------------------------------------------------
-# main
-# -------------------------------------------------
 def main():
     app = QApplication(sys.argv)
     win = MainWindow()

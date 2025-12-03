@@ -1,65 +1,75 @@
+# scan_kundt.py
 import struct
 import numpy as np
-import matplotlib.pyplot as plt
-
 from serial_comm import send_command
 from adc_stream import read_adc_frame
-from motor_control import *
-from fft_tools import fft_bin_at_freq
-from commands import *
+from motor_control import home_motor, wait_until_home_complete, move_to_mm, wait_until_move_complete
+from fft_tools import fft_mag_at_freq
+from commands import CMD_START_SAMPLING, CMD_STOP_SAMPLING, FS
 
-def scan_standing_wave_pmax_pmin(ser):
-    FS = 100000
+def scan_kundt(ser, f_hz, start_mm, end_mm, step_mm):
+    """
+    Perform Kundt tube scan.
+    Returns: positions (list), magnitudes (numpy array), results dict
+    results = { 'p_max', 'p_min', 'idx_max', 'idx_min', 'SWR', 'R_mag' }
+    """
 
-    try:
-        f_hz = float(input("Excitation frequency (Hz): "))
-        start_mm = float(input("Start position (mm): "))
-        end_mm = float(input("End position (mm): "))
-        step_mm = float(input("Step size (mm): "))
-    except:
-        print("Invalid input")
-        return
+    if step_mm <= 0:
+        raise ValueError("step_mm must be > 0")
+    if end_mm <= start_mm:
+        raise ValueError("end_mm must be > start_mm")
 
-    print("Homing…")
-    send_command(ser, CMD_HOME)
+    # --- Homing ---
+    home_motor(ser)
     if not wait_until_home_complete(ser):
-        print("Homing timeout")
-        return
+        raise RuntimeError("Homing timeout")
 
-    print(f"Moving to {start_mm} mm")
-    send_command(ser, CMD_STEPPER_MOVE, struct.pack("<f", start_mm))
-    wait_until_move_complete(ser)
+    # --- Move to start ---
+    move_to_mm(ser, start_mm)
+    if not wait_until_move_complete(ser):
+        raise RuntimeError("Move-to-start timeout")
 
-    positions, magnitudes = [], []
+    positions = []
+    magnitudes = []
 
     x = start_mm
-    while x <= end_mm:
-        print(f"At {x:.2f} mm")
+    while x <= end_mm + 1e-9:
+        positions.append(x)
 
+        # Capture ADC frame: discard first frame to avoid misalignment
         send_command(ser, CMD_START_SAMPLING)
-        samples = read_adc_frame(ser)
+        _ = read_adc_frame(ser)        # discard one frame
+        samples = read_adc_frame(ser)  # use second frame
         send_command(ser, CMD_STOP_SAMPLING)
 
-        fft_val, f_bin = fft_bin_at_freq(samples, FS, f_hz)
-        positions.append(x)
-        magnitudes.append(abs(fft_val))
+        if samples is None:
+            raise RuntimeError("ADC error during scan")
+
+        mag, f_bin = fft_mag_at_freq(samples, FS, f_hz)
+        magnitudes.append(mag)
 
         x += step_mm
-        send_command(ser, CMD_STEPPER_MOVE, struct.pack("<f", x))
-        wait_until_move_complete(ser)
+        if x > end_mm:
+            break
+        move_to_mm(ser, x)
+        if not wait_until_move_complete(ser):
+            raise RuntimeError("Move timeout during scan")
 
-    mag = np.array(magnitudes)
-    idx_max = np.argmax(mag)
-    idx_min = np.argmin(mag)
+    mag_arr = np.array(magnitudes)
+    idx_max = int(np.argmax(mag_arr))
+    idx_min = int(np.argmin(mag_arr))
+    p_max = float(mag_arr[idx_max])
+    p_min = float(mag_arr[idx_min])
+    SWR = p_max / p_min
+    R_mag = (SWR - 1.0) / (SWR + 1.0)
 
-    SWR = mag[idx_max] / mag[idx_min]
-    R = (SWR - 1) / (SWR + 1)
+    results = {
+        "p_max": p_max,
+        "p_min": p_min,
+        "idx_max": idx_max,
+        "idx_min": idx_min,
+        "SWR": SWR,
+        "R_mag": R_mag,
+    }
 
-    print("max:", mag[idx_max])
-    print("min:", mag[idx_min])
-    print("SWR:", SWR)
-    print("|R|:", R)
-
-    plt.plot(positions, mag)
-    plt.grid(True)
-    plt.show()
+    return positions, mag_arr, results
