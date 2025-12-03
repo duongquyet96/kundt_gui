@@ -1,0 +1,23 @@
+# Command IDs
+CMD_READ_SWITCH        = 0x12
+CMD_SET_DIR            = 0x20
+CMD_TOGGLE_DIR         = 0x21
+CMD_STEPPER_MOVE       = 0x30
+CMD_HOME               = 0x31
+CMD_AD9833_SINE_FREQ   = 0x40
+CMD_START_SAMPLING     = 0x50
+CMD_STOP_SAMPLING      = 0x51
+
+CMD_DIGIPOT_SET        = 0x60
+CMD_DIGIPOT_UP         = 0x61
+CMD_DIGIPOT_DOWN       = 0x62
+
+# Status
+STS_ACK = 0xFE
+STS_ERR = 0xFF
+
+# ADC
+SAMPLES_PER_FRAME = 8192
+
+# Sampling rate
+FS = 100000
