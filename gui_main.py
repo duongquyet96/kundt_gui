@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
 
         # Tabs
         tabs = QTabWidget()
-        tabs.addTab(self._build_motor_tab(), "Motor / Switch")
+        tabs.addTab(self._build_motor_tab(), "Position")
         tabs.addTab(self._build_signal_tab(), "Signal / ADC / FFT")
         tabs.addTab(self._build_kundt_tab(), "Kundt Scan")
         tabs.addTab(self._build_gain_tab(), "Gain (Digipot)")
@@ -100,17 +100,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(w)
         grid = QGridLayout()
 
-        btn_toggle_dir = QPushButton("Toggle Direction")
-        btn_toggle_dir.clicked.connect(self.on_toggle_dir)
-        grid.addWidget(btn_toggle_dir, 0, 0)
-
-        btn_set_dir_0 = QPushButton("Set DIR = 0")
-        btn_set_dir_1 = QPushButton("Set DIR = 1")
-        btn_set_dir_0.clicked.connect(lambda: self.on_set_dir(0))
-        btn_set_dir_1.clicked.connect(lambda: self.on_set_dir(1))
-        grid.addWidget(btn_set_dir_0, 0, 1)
-        grid.addWidget(btn_set_dir_1, 0, 2)
-
+        
         self.move_spin = QDoubleSpinBox()
         self.move_spin.setRange(-1000.0, 1000.0)
         self.move_spin.setDecimals(3)
@@ -121,11 +111,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.move_spin, 1, 1)
         grid.addWidget(btn_move, 1, 2)
 
-        btn_read_sw = QPushButton("Read End Switch")
-        btn_read_sw.clicked.connect(self.on_read_switch)
-        self.switch_label = QLabel("Switch: ?")
-        grid.addWidget(btn_read_sw, 2, 0)
-        grid.addWidget(self.switch_label, 2, 1, 1, 2)
+    
 
         btn_home = QPushButton("Home Motor")
         btn_home.clicked.connect(self.on_home)
