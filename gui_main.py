@@ -1,4 +1,3 @@
-# gui_main.py
 import sys
 import struct
 import numpy as np
@@ -17,7 +16,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 from commands import *               # FS, command IDs
-from serial_comm import send_command
+from serial_comm import *
 from adc_stream import read_adc_frame
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
@@ -111,11 +110,21 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.move_spin, 1, 1)
         grid.addWidget(btn_move, 1, 2)
 
-    
+        self.home_offset_spin = QDoubleSpinBox()
+        self.home_offset_spin.setRange(0.0, 20.0)
+        self.home_offset_spin.setDecimals(3)
+        self.home_offset_spin.setValue(2.3)
+
+        btn_set_home_offset = QPushButton("Set Home Offset")
+        btn_set_home_offset.clicked.connect(self.on_set_home_offset)
+
+        grid.addWidget(QLabel("Home Offset (mm):"), 3, 0)
+        grid.addWidget(self.home_offset_spin, 3, 1)
+        grid.addWidget(btn_set_home_offset, 3, 2)
 
         btn_home = QPushButton("Home Motor")
         btn_home.clicked.connect(self.on_home)
-        grid.addWidget(btn_home, 3, 0)
+        grid.addWidget(btn_home, 4, 0)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -146,6 +155,23 @@ class MainWindow(QMainWindow):
         
         freq_group.setLayout(fg_layout)
         layout.addWidget(freq_group)
+
+        fs_group = QGroupBox("Sampling Settings")
+        fs_layout = QHBoxLayout()
+
+        self.fs_spin = QDoubleSpinBox()
+        self.fs_spin.setRange(1000, 200000)
+        self.fs_spin.setValue(20000)
+
+        btn_apply_fs = QPushButton("Apply")
+        btn_apply_fs.clicked.connect(self.on_apply_sampling_settings)
+
+        fs_layout.addWidget(QLabel("Fs (Hz):"))
+        fs_layout.addWidget(self.fs_spin)
+        fs_layout.addWidget(btn_apply_fs)
+
+        fs_group.setLayout(fs_layout)
+        layout.addWidget(fs_group)
 
         adc_group = QGroupBox("ADC / Capture")
         adc_layout = QHBoxLayout()
@@ -258,6 +284,18 @@ class MainWindow(QMainWindow):
         if not self.ensure_connected(): return
         status, _ = send_command(self.serial_mgr.ser, CMD_SET_DIR, bytes([val]))
         QMessageBox.information(self, "Set DIR", f"Status: {status}")
+    def on_set_home_offset(self):
+        if not self.ensure_connected(): return
+
+        value = float(self.home_offset_spin.value())
+        payload = struct.pack("<f", value)
+
+        status, _ = send_command(self.serial_mgr.ser, CMD_SET_HOME_OFFSET, payload)
+
+        if status == 0xFE:
+            QMessageBox.information(self, "Home Offset", f"Home offset set to {value:.3f} mm.")
+        else:
+            QMessageBox.warning(self, "Home Offset", "Failed to set home offset.")
 
     def on_move_mm(self):
         if not self.ensure_connected(): return
@@ -301,6 +339,19 @@ class MainWindow(QMainWindow):
             self, "AD9833",
             "Frequency set OK." if status == STS_ACK else f"Set failed (status {status})"
         )
+
+    def on_apply_sampling_settings(self):
+        if not self.ensure_connected(): return
+        
+        fs = float(self.fs_spin.value())
+
+        ok1 = set_sampling_frequency(self.serial_mgr.ser, fs)
+
+        if ok1:
+            QMessageBox.information(self, "Sampling", "Sampling settings updated.")
+        else:
+            QMessageBox.warning(self, "Sampling", "Failed to update sampling settings.")
+
     def on_mute(self):
         if not self.ensure_connected():
             return

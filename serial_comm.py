@@ -61,3 +61,18 @@ def send_command(ser, cmd, payload=b""):
     except Exception as e:
         print("Command error:", e)
         return None, None
+def set_home_offset(ser, offset_mm: float):
+    payload = struct.pack("<f", offset_mm)
+    status, _ = send_command(ser, CMD_SET_HOME_OFFSET, payload)
+    return status == 0xFE  # STS_ACK
+
+def get_home_offset(ser):
+    status, payload = send_command(ser, CMD_GET_HOME_OFFSET)
+    if status == 0xFE and payload and len(payload) == 4:
+        return struct.unpack("<f", payload)[0]
+    return None
+
+def set_sampling_frequency(ser, fs_hz):
+    payload = struct.pack("<f", float(fs_hz))
+    status, _ = send_command(ser, CMD_SET_FS, payload)
+    return status == STS_ACK
