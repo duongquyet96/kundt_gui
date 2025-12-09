@@ -1,4 +1,3 @@
-# fft_tools.py
 import numpy as np
 
 def windowed_centered(samples):
