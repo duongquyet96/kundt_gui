@@ -4,6 +4,8 @@ CMD_SET_DIR            = 0x20
 CMD_TOGGLE_DIR         = 0x21
 CMD_STEPPER_MOVE       = 0x30
 CMD_HOME               = 0x31
+CMD_GET_POSITION       = 0x37
+
 CMD_AD9833_SINE_FREQ   = 0x40
 CMD_START_SAMPLING     = 0x50
 CMD_STOP_SAMPLING      = 0x51
@@ -22,4 +24,4 @@ SAMPLES_PER_FRAME = 4096
 
 
 # Sampling rate
-FS = 100000
+FS = 20000

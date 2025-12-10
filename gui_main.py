@@ -14,14 +14,14 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox,
     QGroupBox, QGridLayout, QMessageBox, QTabWidget, QFormLayout
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 
 from commands import *               # FS, command IDs
 from serial_comm import send_command
 from adc_stream import read_adc_frame
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
-from scan_kundt import scan_kundt    # <-- use shared backend scan
+from scan_kundt import *    # <-- use shared backend scan
 
 
 class SerialManager:
@@ -57,13 +57,18 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Kundt Tube Controller GUI")
         self.serial_mgr = SerialManager()
         self.last_samples = None
+        self.live_mode = False
+        self.live_timer = None
+
+
         self.FS = 20000.0      # default sampling rate
         self.FFT_N = 4096       # default FFT length
+
         # Zoom parameters
-        self.adc_zoom_factor = 1.0
+        self.adc_zoom_factor = 15.0
         self.adc_zoom_center = 0
         # Y-axis zoom parameters
-        self.y_zoom_factor = 1.0
+        self.y_zoom_factor = 5.0
         self.y_center = 1.65   # midpoint of 0–3.3 V
 
 
@@ -141,7 +146,7 @@ class MainWindow(QMainWindow):
         self.freq_spin.setDecimals(2)
         self.freq_spin.setValue(1000.0)
 
-        btn_set_freq = QPushButton("Set Frequency (Hz)")
+        btn_set_freq = QPushButton("Play Tone")
         btn_set_freq.clicked.connect(self.on_set_freq)
 
         btn_mute = QPushButton("Mute")
@@ -155,13 +160,52 @@ class MainWindow(QMainWindow):
         freq_group.setLayout(fg_layout)
         layout.addWidget(freq_group)
 
+        # ---------------- FFT Settings -----------------
+        fft_group = QGroupBox("FFT Settings")
+        fft_layout = QHBoxLayout()
+
+        # Sampling frequency input (FS)
+        self.fs_spin = QDoubleSpinBox()
+        self.fs_spin.setRange(100.0, 500000.0)
+        self.fs_spin.setValue(20000.0)  # default FS = 100 kHz
+        self.fs_spin.setDecimals(1)
+
+        # FFT size (N)
+        self.fft_n_spin = QSpinBox()
+        self.fft_n_spin.setRange(256, 16384)
+        self.fft_n_spin.setSingleStep(256)
+        self.fft_n_spin.setValue(4096)
+
+        # Apply button
+        btn_apply_fft = QPushButton("Apply FFT Settings")
+        btn_apply_fft.clicked.connect(self.on_apply_fft_settings)
+
+        fft_layout.addWidget(QLabel("Sampling FS (Hz):"))
+        fft_layout.addWidget(self.fs_spin)
+        fft_layout.addWidget(QLabel("FFT size N:"))
+        fft_layout.addWidget(self.fft_n_spin)
+        fft_layout.addWidget(btn_apply_fft)
+
+        fft_group.setLayout(fft_layout)
+        layout.addWidget(fft_group)
+
         adc_group = QGroupBox("ADC / Capture")
         adc_layout = QHBoxLayout()
-        btn_capture = QPushButton("Capture Frame")
-        btn_capture.clicked.connect(self.on_capture_frame)
-        adc_layout.addWidget(btn_capture)
+        #btn_capture = QPushButton("Capture Frame")
+        #btn_capture.clicked.connect(self.on_capture_frame)
+        #adc_layout.addWidget(btn_capture)
         adc_group.setLayout(adc_layout)
         layout.addWidget(adc_group)
+
+        btn_live_start = QPushButton("Start Live View")
+        btn_live_start.clicked.connect(self.on_start_live)
+
+        btn_live_stop = QPushButton("Stop Live View")
+        btn_live_stop.clicked.connect(self.on_stop_live)
+
+        adc_layout.addWidget(btn_live_start)
+        adc_layout.addWidget(btn_live_stop)
+
 
         # ---------- Zoom Controls (Right Side) ----------
         zoom_panel = QWidget()
@@ -202,36 +246,6 @@ class MainWindow(QMainWindow):
         zoom_layout.addWidget(btn_y_zoom_in)
         zoom_layout.addWidget(btn_y_zoom_out)
         zoom_layout.addWidget(btn_y_reset)
-
-        # ---------------- FFT Settings -----------------
-        fft_group = QGroupBox("FFT Settings")
-        fft_layout = QHBoxLayout()
-
-        # Sampling frequency input (FS)
-        self.fs_spin = QDoubleSpinBox()
-        self.fs_spin.setRange(100.0, 500000.0)
-        self.fs_spin.setValue(10000.0)  # default FS = 100 kHz
-        self.fs_spin.setDecimals(1)
-
-        # FFT size (N)
-        self.fft_n_spin = QSpinBox()
-        self.fft_n_spin.setRange(256, 16384)
-        self.fft_n_spin.setSingleStep(256)
-        self.fft_n_spin.setValue(4096)
-
-        # Apply button
-        btn_apply_fft = QPushButton("Apply FFT Settings")
-        btn_apply_fft.clicked.connect(self.on_apply_fft_settings)
-
-        fft_layout.addWidget(QLabel("Sampling FS (Hz):"))
-        fft_layout.addWidget(self.fs_spin)
-        fft_layout.addWidget(QLabel("FFT size N:"))
-        fft_layout.addWidget(self.fft_n_spin)
-        fft_layout.addWidget(btn_apply_fft)
-
-        fft_group.setLayout(fft_layout)
-        layout.addWidget(fft_group)
-
 
         self.time_canvas = MplCanvas(self, width=5, height=3)
         self.fft_canvas = MplCanvas(self, width=5, height=3)
@@ -283,14 +297,35 @@ class MainWindow(QMainWindow):
         self.scan_end_spin.setRange(0.0, 500.0)
         self.scan_end_spin.setValue(250.0)
 
-        self.scan_step_spin = QDoubleSpinBox()
-        self.scan_step_spin.setRange(0.1, 50.0)
-        self.scan_step_spin.setValue(5.0)
+        # --- New GUI fields for coarse/fine scanning ---
+        self.coarse_step_spin = QDoubleSpinBox()
+        self.coarse_step_spin.setRange(0.1, 100.0)
+        self.coarse_step_spin.setValue(10.0)
+        self.coarse_step_spin.setDecimals(2)
+
+        self.fine_step_spin = QDoubleSpinBox()
+        self.fine_step_spin.setRange(0.01, 10.0)
+        self.fine_step_spin.setValue(1.0)
+        self.fine_step_spin.setDecimals(3)
+
+        self.fine_window_spin = QDoubleSpinBox()
+        self.fine_window_spin.setRange(1.0, 100.0)
+        self.fine_window_spin.setValue(10.0)
+        self.fine_window_spin.setDecimals(2)
+
+        form.addRow("Coarse step (mm):", self.coarse_step_spin)
+        form.addRow("Fine step (mm):",   self.fine_step_spin)
+        form.addRow("Fine window (mm):", self.fine_window_spin)
+
+
+        #self.scan_step_spin = QDoubleSpinBox()
+        #self.scan_step_spin.setRange(0.1, 50.0)
+        #self.scan_step_spin.setValue(5.0)
 
         form.addRow("Frequency (Hz):", self.scan_freq_spin)
         form.addRow("Start (mm):", self.scan_start_spin)
         form.addRow("End (mm):", self.scan_end_spin)
-        form.addRow("Step (mm):", self.scan_step_spin)
+        #form.addRow("Step (mm):", self.scan_step_spin)
 
         layout.addLayout(form)
 
@@ -335,13 +370,8 @@ class MainWindow(QMainWindow):
     def on_connect(self):
         port = self.port_edit.text().strip()
         try:
-            baud = int(self.baud_edit.text().strip())
-        except ValueError:
-            QMessageBox.warning(self, "Error", "Invalid baud rate.")
-            return
-        try:
-            self.serial_mgr.connect(port, baud)
-            QMessageBox.information(self, "Connected", f"Connected to {port} at {baud} baud.")
+            self.serial_mgr.connect(port, 115200)
+            QMessageBox.information(self, "Connected", f"Connected to {port}.")
         except Exception as e:
             QMessageBox.critical(self, "Connection error", str(e))
 
@@ -433,6 +463,51 @@ class MainWindow(QMainWindow):
         self._update_time_plot(samples)
         self._update_fft_plot(samples)
     
+    def on_live_update(self):
+        if not self.live_mode:
+            return
+
+        try:
+            samples = read_adc_frame(self.serial_mgr.ser)
+        except Exception:
+            return
+
+        if samples is None:
+            return
+
+        # Update waveform
+        self.last_samples = samples
+        self._update_time_plot(samples)
+
+        # Update FFT live
+        self._update_fft_plot(samples)
+
+    def on_start_live(self):
+        if not self.ensure_connected():
+            return
+
+        # Start streaming on STM32
+        send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+
+        # QTimer to update graph every 30 ms
+        if self.live_timer is None:
+            self.live_timer = QTimer()
+            self.live_timer.timeout.connect(self.on_live_update)
+
+        self.live_mode = True
+        self.live_timer.start(30)   # ~33 FPS oscilloscope
+
+
+    def on_stop_live(self):
+        if self.live_timer:
+            self.live_timer.stop()
+
+        self.live_mode = False
+
+        # Ask STM32 to stop streaming
+        send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+
+
     def on_zoom_in(self):
         self.adc_zoom_factor *= 1.5
         if self.adc_zoom_factor > 100:
@@ -580,55 +655,106 @@ class MainWindow(QMainWindow):
         v = int(self.gain_spin.value())
         digipot_set(self.serial_mgr.ser, v)
 
+    def _mute_speaker(self):
+        payload = struct.pack("<f", 0.0)
+        send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+
     def on_run_scan(self):
-        if not self.ensure_connected(): return
-
-        f_hz = float(self.scan_freq_spin.value())
-        start_mm = float(self.scan_start_spin.value())
-        end_mm = float(self.scan_end_spin.value())
-        step_mm = float(self.scan_step_spin.value())
-
-        try:
-            positions, mag_arr, res = scan_kundt(
-                self.serial_mgr.ser, f_hz, start_mm, end_mm, step_mm
-            )
-        except Exception as e:
-            QMessageBox.warning(self, "Scan error", str(e))
+        if not self.ensure_connected():
             return
 
-        p_max = res["p_max"]
-        p_min = res["p_min"]
-        idx_max = res["idx_max"]
-        idx_min = res["idx_min"]
-        SWR = res["SWR"]
-        R_mag = res["R_mag"]
+        f_hz     = float(self.scan_freq_spin.value())
+        start_mm = float(self.scan_start_spin.value())
+        end_mm   = float(self.scan_end_spin.value())
 
+        coarse_step_mm = float(self.coarse_step_spin.value())
+        fine_step_mm   = float(self.fine_step_spin.value())
+        fine_window_mm = float(self.fine_window_spin.value())
+
+        # Turn on tone
+        payload = struct.pack("<f", f_hz)
+        send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+
+        # Run the two-stage scan
+        try:
+            result = scan_kundt_two_stage(
+                self.serial_mgr.ser,
+                f_hz,
+                start_mm,
+                end_mm,
+                coarse_step_mm,
+                fine_step_mm,
+                fine_window_mm,
+                self.FS    # sampling frequency from GUI
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Scan Error", str(e))
+            self._mute_speaker()
+            return
+
+        # Turn tone off
+        self._mute_speaker()
+
+        # ----------------------------
+        # Extract results
+        # ----------------------------
+
+        coarse_pos = result["coarse_positions"]
+        coarse_mag = result["coarse_mag"]
+
+        fine_max_pos = result["fine_max_positions"]
+        fine_max_mag = result["fine_max_mag"]
+
+        fine_min_pos = result["fine_min_positions"]
+        fine_min_mag = result["fine_min_mag"]
+
+        # Find fine max/min
+        idx_fmax = int(np.argmax(fine_max_mag))
+        idx_fmin = int(np.argmin(fine_min_mag))
+
+        real_pmax = fine_max_mag[idx_fmax]
+        real_pmax_x = fine_max_pos[idx_fmax]
+
+        real_pmin = fine_min_mag[idx_fmin]
+        real_pmin_x = fine_min_pos[idx_fmin]
+
+        # Compute SWR
+        p_min_safe = max(real_pmin, 1e-9)
+        SWR = real_pmax / p_min_safe
+        R_mag = (SWR - 1.0) / (SWR + 1.0)
+
+        # Output summary
         self.scan_result_label.setText(
-            f"p_max={p_max:.3f} at {positions[idx_max]:.2f} mm, "
-            f"p_min={p_min:.3f} at {positions[idx_min]:.2f} mm, "
+            f"Coarse peak≈ {coarse_pos[np.argmax(coarse_mag)]:.1f} mm | "
+            f"Refined Pmax={real_pmax:.3f} at {real_pmax_x:.2f} mm, "
+            f"Pmin={real_pmin:.3f} at {real_pmin_x:.2f} mm, "
             f"SWR={SWR:.3f}, |R|={R_mag:.3f}"
         )
 
-        # Plot standing wave
+        # ----------------------------
+        # Plot coarse + fine scans
+        # ----------------------------
         ax = self.kundt_canvas.ax
         ax.clear()
-        ax.plot(positions, mag_arr, label="|P| raw")
 
-        # optional smoothing
-        if len(mag_arr) >= 5:
-            mag_s = np.convolve(mag_arr, np.ones(5)/5, mode='same')
-            ax.plot(positions, mag_s, '--', label="|P| smoothed")
+        # coarse curve
+        ax.plot(coarse_pos, coarse_mag, "k--", label="Coarse scan")
 
-        ax.scatter([positions[idx_max]], [p_max], label="p_max")
-        ax.scatter([positions[idx_min]], [p_min], label="p_min")
+        # fine scans
+        ax.plot(fine_max_pos, fine_max_mag, "r-", label="Fine region (Pmax)")
+        ax.plot(fine_min_pos, fine_min_mag, "b-", label="Fine region (Pmin)")
 
-        ax.set_title("Standing Wave |P| vs Position")
+        # markers
+        ax.scatter([real_pmax_x], [real_pmax], c="red", s=80)
+        ax.scatter([real_pmin_x], [real_pmin], c="blue", s=80)
+
+        ax.set_title("Two-stage Kundt Scan")
         ax.set_xlabel("Position (mm)")
-        ax.set_ylabel("Amplitude |P|")
+        ax.set_ylabel("|P| amplitude")
         ax.grid(True)
         ax.legend()
-        self.kundt_canvas.draw()
 
+        self.kundt_canvas.draw()
 
 def main():
     app = QApplication(sys.argv)
@@ -642,8 +768,9 @@ def main():
         min-height: 40px;
     }
     QLineEdit, QDoubleSpinBox, QSpinBox {
-        font-size: 18px;
-        min-height: 32px;
+        font-size: 20px;
+        min-height: 40px;     /* match button height */
+        padding: 6px;         /* improves internal spacing */
     }
     QTabBar::tab {
         font-size: 18px;
