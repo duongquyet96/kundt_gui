@@ -71,6 +71,14 @@ class MainWindow(QMainWindow):
         self.y_zoom_factor = 5.0
         self.y_center = 1.65   # midpoint of 0–3.3 V
 
+        self.cont_scan_active = False
+        self.cont_scan_timer = None
+        self.cont_scan_positions = []
+        self.cont_scan_mags = []
+        self.cont_scan_freq = 1000.0  # will be set from UI
+        self.cont_scan_end_mm = 250.0
+
+
 
         self._build_ui()
 
@@ -332,6 +340,17 @@ class MainWindow(QMainWindow):
         btn_run_scan = QPushButton("Run Scan")
         btn_run_scan.clicked.connect(self.on_run_scan)
         layout.addWidget(btn_run_scan)
+
+        # --- New continuous scan controls ---
+        btn_cont_start = QPushButton("Start Continuous Scan")
+        btn_cont_start.clicked.connect(self.on_start_cont_scan)
+
+        btn_cont_stop = QPushButton("Stop Continuous Scan")
+        btn_cont_stop.clicked.connect(self.on_stop_cont_scan)
+
+        layout.addWidget(btn_cont_start)
+        layout.addWidget(btn_cont_stop)
+
 
         self.kundt_canvas = MplCanvas(self, width=5, height=3)
         layout.addWidget(self.kundt_canvas)
@@ -658,6 +677,179 @@ class MainWindow(QMainWindow):
     def _mute_speaker(self):
         payload = struct.pack("<f", 0.0)
         send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+
+    def get_position_mm(self):
+        status, payload = send_command(self.serial_mgr.ser, CMD_GET_POSITION)
+        if status != STS_ACK or not payload or len(payload) < 4:
+            return None
+        return struct.unpack("<f", payload[:4])[0]
+
+    def find_peaks_and_valleys(self, positions, mags, min_prominence=0.05):
+        """
+        Very simple local-extrema finder.
+        min_prominence is fraction of global max to ignore tiny ripples.
+        Returns (peak_indices, valley_indices).
+        """
+        if len(mags) < 3:
+            return [], []
+
+        mags_arr = np.array(mags, dtype=float)
+        max_mag = np.max(mags_arr)
+        if max_mag <= 0:
+            return [], []
+
+        peak_idx = []
+        valley_idx = []
+
+        for i in range(1, len(mags_arr) - 1):
+            left = mags_arr[i - 1]
+            mid = mags_arr[i]
+            right = mags_arr[i + 1]
+
+            # relative prominence
+            if mid > left and mid > right and mid > min_prominence * max_mag:
+                peak_idx.append(i)
+            if mid < left and mid < right and mid < (1.0 - min_prominence) * max_mag:
+                valley_idx.append(i)
+
+        return peak_idx, valley_idx
+
+    def _update_kundt_live_plot(self):
+        if not self.cont_scan_positions:
+            return
+
+        ax = self.kundt_canvas.ax
+        ax.clear()
+
+        pos = np.array(self.cont_scan_positions, dtype=float)
+        mag = np.array(self.cont_scan_mags, dtype=float)
+
+        ax.plot(pos, mag, label="|P|(live)")
+
+        # auto-detect multiple maxima / minima
+        peak_idx, valley_idx = self.find_peaks_and_valleys(pos, mag, min_prominence=0.1)
+
+        if peak_idx:
+            ax.scatter(pos[peak_idx], mag[peak_idx], color="red", label="Maxima")
+        if valley_idx:
+            ax.scatter(pos[valley_idx], mag[valley_idx], color="blue", label="Minima")
+
+        ax.set_title("Standing Wave |P| vs Position (Live)")
+        ax.set_xlabel("Position (mm)")
+        ax.set_ylabel("|P| amplitude")
+        ax.grid(True)
+        ax.legend()
+
+        self.kundt_canvas.draw()
+
+        # Update text label with count of peaks/minima
+        self.scan_result_label.setText(
+            f"Live peaks: {len(peak_idx)}, minima: {len(valley_idx)}"
+        )
+
+    def on_start_cont_scan(self):
+        if not self.ensure_connected():
+            return
+
+        # read parameters from GUI
+        f_hz     = float(self.scan_freq_spin.value())
+        start_mm = float(self.scan_start_spin.value())
+        end_mm   = float(self.scan_end_spin.value())
+
+        self.cont_scan_freq = f_hz
+        self.cont_scan_end_mm = end_mm
+
+        # reset buffers
+        self.cont_scan_positions = []
+        self.cont_scan_mags = []
+
+        # 1) Home + go to start
+        status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
+        if status != STS_ACK:
+            QMessageBox.warning(self, "Continuous Scan", "Home failed to start.")
+            return
+        if not wait_until_home_complete(self.serial_mgr.ser):
+            QMessageBox.warning(self, "Continuous Scan", "Homing timeout.")
+            return
+
+        # Move to start_mm once
+        payload = struct.pack("<f", start_mm)
+        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, payload)
+        if status != STS_ACK:
+            QMessageBox.warning(self, "Continuous Scan", "Move to start failed.")
+            return
+        if not wait_until_move_complete(self.serial_mgr.ser):
+            QMessageBox.warning(self, "Continuous Scan", "Move-to-start timeout.")
+            return
+
+        # 2) Set excitation tone
+        payload = struct.pack("<f", f_hz)
+        status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+        if status != STS_ACK:
+            QMessageBox.warning(self, "Continuous Scan", "Failed to set tone.")
+            return
+
+        # 3) Start ADC streaming
+        send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+
+        # 4) Start a long move from start_mm to end_mm (non-blocking on Python side)
+        payload = struct.pack("<f", end_mm)
+        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, payload)
+        if status != STS_ACK:
+            QMessageBox.warning(self, "Continuous Scan", "Scan move failed.")
+            # stop ADC, mute
+            send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+            self._mute_speaker()
+            return
+
+        # 5) Setup timer to process frames & plot live
+        if self.cont_scan_timer is None:
+            self.cont_scan_timer = QTimer()
+            self.cont_scan_timer.timeout.connect(self.on_cont_scan_tick)
+
+        self.cont_scan_active = True
+        self.cont_scan_timer.start(50)  # every 50 ms
+
+    def on_stop_cont_scan(self):
+        if self.cont_scan_timer:
+            self.cont_scan_timer.stop()
+
+        self.cont_scan_active = False
+
+        # Stop ADC & mute tone
+        send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+        self._mute_speaker()
+
+    def on_cont_scan_tick(self):
+        if not self.cont_scan_active:
+            return
+
+        # 1) Read one ADC frame (blocking until frame available)
+        samples = read_adc_frame(self.serial_mgr.ser)
+        if samples is None:
+            # Could be timeout; you can choose to stop scan or just skip
+            return
+
+        # 2) Get current position from MCU
+        pos_mm = self.get_position_mm()
+        if pos_mm is None:
+            return
+
+        # Stop condition: reached end of scan
+        if pos_mm >= self.cont_scan_end_mm:
+            self.on_stop_cont_scan()
+            return
+
+        # 3) Compute magnitude at excitation frequency
+        from scan_kundt import fft_mag_at_freq  # if not already imported
+        mag, f_bin = fft_mag_at_freq(samples, self.FS, self.cont_scan_freq)
+
+        # 4) Append to trace
+        self.cont_scan_positions.append(pos_mm)
+        self.cont_scan_mags.append(mag)
+
+        # 5) Update live standing-wave plot with auto peak detection
+        self._update_kundt_live_plot()
 
     def on_run_scan(self):
         if not self.ensure_connected():
