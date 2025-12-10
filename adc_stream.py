@@ -1,5 +1,5 @@
 import numpy as np
-from commands import SAMPLES_PER_FRAME
+from commands import SAMPLES_PER_FRAME, USB_SAMPLES_PER_PACKET
 
 def read_exact(ser, n):
     buf = bytearray()
@@ -10,15 +10,47 @@ def read_exact(ser, n):
         buf.extend(chunk)
     return bytes(buf)
 
-def read_adc_frame(ser):
-    # Wait for header
+def read_packet(ser, packet_samples):
+    # sync to AB CD
     while True:
-        b = ser.read(1)
-        if b != b'\xAA':
+        if ser.read(1) != b'\xAB':
             continue
-        if ser.read(1) == b'\x55':
-            break
+        if ser.read(1) != b'\xCD':
+            continue
+        break
 
-    # Read full frame safely
-    data = read_exact(ser, SAMPLES_PER_FRAME * 2)
-    return np.frombuffer(data, dtype=np.uint16)
+    # read sequence number
+    seq_lo = ser.read(1)[0]
+    seq_hi = ser.read(1)[0]
+    seq = seq_lo | (seq_hi << 8)
+
+    # read samples
+    payload = read_exact(ser, packet_samples * 2)
+    samples = np.frombuffer(payload, dtype=np.uint16)
+
+    return seq, samples
+
+
+def read_adc_frame(ser):
+    total = SAMPLES_PER_FRAME
+    ps = USB_SAMPLES_PER_PACKET
+    packets = total // ps
+
+    out = np.zeros(total, dtype=np.uint16)
+    expected_seq = None
+    idx = 0
+
+    for _ in range(packets):
+        seq, samples = read_packet(ser, ps)
+
+        if expected_seq is None:
+            expected_seq = seq
+        else:
+            if seq != expected_seq:
+                print("WARNING: Packet lost or misaligned (got", seq, "expected", expected_seq, ")")
+
+        out[idx:idx+ps] = samples
+        idx += ps
+        expected_seq = (expected_seq + 1) & 0xFFFF
+
+    return out

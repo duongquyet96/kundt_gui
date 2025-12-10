@@ -57,6 +57,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Kundt Tube Controller GUI")
         self.serial_mgr = SerialManager()
         self.last_samples = None
+        self.FS = 20000.0      # default sampling rate
+        self.FFT_N = 4096       # default FFT length
+        # Zoom parameters
+        self.adc_zoom_factor = 1.0
+        self.adc_zoom_center = 0
+        # Y-axis zoom parameters
+        self.y_zoom_factor = 1.0
+        self.y_center = 1.65   # midpoint of 0–3.3 V
+
 
         self._build_ui()
 
@@ -68,7 +77,7 @@ class MainWindow(QMainWindow):
         conn_group = QGroupBox("Connection")
         conn_layout = QHBoxLayout()
         self.port_edit = QLineEdit("COM5")
-        self.baud_edit = QLineEdit("115200")
+
         self.connect_btn = QPushButton("Connect")
         self.disconnect_btn = QPushButton("Disconnect")
 
@@ -77,8 +86,7 @@ class MainWindow(QMainWindow):
 
         conn_layout.addWidget(QLabel("Port:"))
         conn_layout.addWidget(self.port_edit)
-        conn_layout.addWidget(QLabel("Baud:"))
-        conn_layout.addWidget(self.baud_edit)
+
         conn_layout.addWidget(self.connect_btn)
         conn_layout.addWidget(self.disconnect_btn)
         conn_group.setLayout(conn_layout)
@@ -155,11 +163,103 @@ class MainWindow(QMainWindow):
         adc_group.setLayout(adc_layout)
         layout.addWidget(adc_group)
 
+        # ---------- Zoom Controls (Right Side) ----------
+        zoom_panel = QWidget()
+        zoom_layout = QVBoxLayout(zoom_panel)
+        zoom_layout.setContentsMargins(0, 0, 0, 0)
+
+        btn_zoom_in = QPushButton("X+")
+        btn_zoom_out = QPushButton("X–")
+        btn_zoom_reset = QPushButton("XR")
+
+        btn_y_zoom_in = QPushButton("Y+")
+        btn_y_zoom_out = QPushButton("Y–")
+        btn_y_reset = QPushButton("YR")
+
+        # Make buttons small
+        for b in (btn_zoom_in, btn_zoom_out, btn_zoom_reset):
+            b.setFixedSize(40, 30)    # small oscilloscope-style buttons
+            b.setStyleSheet("font-size: 16px; padding: 2px;")
+
+        btn_zoom_in.clicked.connect(self.on_zoom_in)
+        btn_zoom_out.clicked.connect(self.on_zoom_out)
+        btn_zoom_reset.clicked.connect(self.on_zoom_reset)
+
+        zoom_layout.addWidget(btn_zoom_in)
+        zoom_layout.addWidget(btn_zoom_out)
+        zoom_layout.addWidget(btn_zoom_reset)
+        zoom_layout.addStretch()
+
+        
+        for b in (btn_y_zoom_in, btn_y_zoom_out, btn_y_reset):
+            b.setFixedSize(40, 30)
+            b.setStyleSheet("font-size: 16px; padding: 2px;")
+
+        btn_y_zoom_in.clicked.connect(self.on_y_zoom_in)
+        btn_y_zoom_out.clicked.connect(self.on_y_zoom_out)
+        btn_y_reset.clicked.connect(self.on_y_zoom_reset)
+
+        zoom_layout.addWidget(btn_y_zoom_in)
+        zoom_layout.addWidget(btn_y_zoom_out)
+        zoom_layout.addWidget(btn_y_reset)
+
+        # ---------------- FFT Settings -----------------
+        fft_group = QGroupBox("FFT Settings")
+        fft_layout = QHBoxLayout()
+
+        # Sampling frequency input (FS)
+        self.fs_spin = QDoubleSpinBox()
+        self.fs_spin.setRange(100.0, 500000.0)
+        self.fs_spin.setValue(10000.0)  # default FS = 100 kHz
+        self.fs_spin.setDecimals(1)
+
+        # FFT size (N)
+        self.fft_n_spin = QSpinBox()
+        self.fft_n_spin.setRange(256, 16384)
+        self.fft_n_spin.setSingleStep(256)
+        self.fft_n_spin.setValue(4096)
+
+        # Apply button
+        btn_apply_fft = QPushButton("Apply FFT Settings")
+        btn_apply_fft.clicked.connect(self.on_apply_fft_settings)
+
+        fft_layout.addWidget(QLabel("Sampling FS (Hz):"))
+        fft_layout.addWidget(self.fs_spin)
+        fft_layout.addWidget(QLabel("FFT size N:"))
+        fft_layout.addWidget(self.fft_n_spin)
+        fft_layout.addWidget(btn_apply_fft)
+
+        fft_group.setLayout(fft_layout)
+        layout.addWidget(fft_group)
+
+
         self.time_canvas = MplCanvas(self, width=5, height=3)
         self.fft_canvas = MplCanvas(self, width=5, height=3)
 
+        # Wrap ADC graph + zoom panel
+        adc_container = QWidget()
+        adc_hbox = QHBoxLayout(adc_container)
+        adc_hbox.setContentsMargins(0, 0, 0, 0)
+        adc_hbox.setSpacing(5)
+
+        # The ADC plot should expand as much as possible
+        adc_hbox.addWidget(self.time_canvas, stretch=1)
+
+        # Wrap zoom panel inside a right-aligned container
+        zoom_panel_container = QWidget()
+        zoom_panel_layout = QVBoxLayout(zoom_panel_container)
+        zoom_panel_layout.setContentsMargins(0, 0, 0, 0)
+        zoom_panel_layout.addWidget(zoom_panel)
+        zoom_panel_layout.addStretch()
+
+        adc_hbox.addWidget(zoom_panel_container)
+        adc_hbox.setStretchFactor(self.time_canvas, 1)
+        adc_hbox.setStretchFactor(zoom_panel_container, 0)
+
         layout.addWidget(QLabel("Time-domain signal"))
-        layout.addWidget(self.time_canvas)
+        layout.addWidget(adc_container)
+
+
         layout.addWidget(QLabel("FFT magnitude"))
         layout.addWidget(self.fft_canvas)
         layout.addStretch()
@@ -313,6 +413,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Speaker Mute", "Speaker muted (frequency = 0 Hz).")
         else:
             QMessageBox.warning(self, "Speaker Mute", f"Failed to mute. Status={status}")
+    def on_apply_fft_settings(self):
+        self.FS = float(self.fs_spin.value())
+        self.FFT_N = int(self.fft_n_spin.value())
+        QMessageBox.information(self, "FFT Settings",
+                                f"Sampling FS set to {self.FS} Hz\nFFT size N = {self.FFT_N}")
 
     def on_capture_frame(self):
         if not self.ensure_connected(): return
@@ -327,34 +432,148 @@ class MainWindow(QMainWindow):
         self.last_samples = samples
         self._update_time_plot(samples)
         self._update_fft_plot(samples)
+    
+    def on_zoom_in(self):
+        self.adc_zoom_factor *= 1.5
+        if self.adc_zoom_factor > 100:
+            self.adc_zoom_factor = 100
+
+        if self.last_samples is not None:
+            self.adc_zoom_center = len(self.last_samples) // 2
+            self._update_time_plot(self.last_samples)
+
+
+    def on_zoom_out(self):
+        self.adc_zoom_factor /= 1.5
+        if self.adc_zoom_factor < 1.0:
+            self.adc_zoom_factor = 1.0
+
+        if self.last_samples is not None:
+            self._update_time_plot(self.last_samples)
+
+
+    def on_zoom_reset(self):
+        self.adc_zoom_factor = 1.0
+        self.adc_zoom_center = 0
+
+        if self.last_samples is not None:
+            self._update_time_plot(self.last_samples)
+
+    def on_y_zoom_in(self):
+        self.y_zoom_factor *= 1.5
+        if self.y_zoom_factor > 50:
+            self.y_zoom_factor = 50
+        if self.last_samples is not None:
+            self._update_time_plot(self.last_samples)
+
+    def on_y_zoom_out(self):
+        self.y_zoom_factor /= 1.5
+        if self.y_zoom_factor < 1.0:
+            self.y_zoom_factor = 1.0
+        if self.last_samples is not None:
+            self._update_time_plot(self.last_samples)
+
+    def on_y_zoom_reset(self):
+        self.y_zoom_factor = 1.0
+        if self.last_samples is not None:
+            self._update_time_plot(self.last_samples)
+
 
     def _update_time_plot(self, samples):
         ax = self.time_canvas.ax
         ax.clear()
-        ax.plot(samples)
+
+        # --- Convert ADC → Volts ---
+        ADC_VREF = 3.3
+        ADC_MAX = 4096.0
+        volts = samples * (ADC_VREF / ADC_MAX)
+
+        N = len(volts)
+
+        # ---- Determine visible range based on zoom ----
+        if self.adc_zoom_factor <= 1.0:
+            idx0, idx1 = 0, N
+        else:
+            window = int(N / self.adc_zoom_factor)
+            half = window // 2
+            c = self.adc_zoom_center
+            idx0 = max(0, c - half)
+            idx1 = min(N, idx0 + window)
+
+        # ---- Plot ----
+        ax.plot(range(idx0, idx1), volts[idx0:idx1])
+
         ax.set_title("ADC Time Signal")
         ax.set_xlabel("Sample index")
-        ax.set_ylabel("ADC value")
+        ax.set_ylabel("Voltage (V)")
         ax.grid(True)
+
+        # ---- FIXED Y-AXIS 0–3.3 V ----
+        ax.set_ylim(0.0, 3.3)
+        # ---- FIXED OR ZOOMED Y-AXIS ----
+        if self.y_zoom_factor <= 1.0:
+            # Default 0–3.3 V
+            ax.set_ylim(0.0, 3.3)
+
+        else:
+            # Full 3.3 V amplitude divided by zoom factor
+            half_span = (3.3 / 2) / self.y_zoom_factor
+
+            # Zoom window centered at 1.65 V
+            y0 = 1.65 - half_span
+            y1 = 1.65 + half_span
+
+            # Clamp to valid voltage range
+            y0 = max(0.0, y0)
+            y1 = min(3.3, y1)
+
+            ax.set_ylim(y0, y1)
+
         self.time_canvas.draw()
+
 
     def _update_fft_plot(self, samples):
         ax = self.fft_canvas.ax
         ax.clear()
-        x = samples.astype(float)
+
+        # Get user-selected FFT size N
+        N = self.FFT_N
+
+        # Clip or zero-pad sample array
+        if len(samples) > N:
+            x = samples[:N].astype(float)
+        else:
+            x = np.zeros(N, dtype=float)
+            x[:len(samples)] = samples.astype(float)
+
+        # Remove DC and apply window
         x -= np.mean(x)
-        x *= np.hanning(len(x))
-        N = len(x)
+        x *= np.hanning(N)
+
+        # Compute FFT
         fft_vals = np.fft.rfft(x)
-        fft_mag = np.abs(fft_vals) * 2 / N
-        freqs = np.fft.rfftfreq(N, 1.0 / FS)
+        fft_mag = np.abs(fft_vals) * 2.0 / N
+
+        # Frequency axis using user-selected sampling FS
+        freqs = np.fft.rfftfreq(N, 1.0 / self.FS)
+
         ax.plot(freqs, fft_mag)
-        ax.set_xlim(0, FS/2)
+
+        # Limit x-axis to 0–Nyquist
+        ax.set_xlim(0, freqs[-1])
+
+        # ----- Add ticks every 500 Hz -----
+        max_freq = freqs[-1]
+        tick_step = 500
+        ax.set_xticks(np.arange(0, max_freq + tick_step, tick_step))
+
         ax.set_title("FFT magnitude")
         ax.set_xlabel("Frequency (Hz)")
         ax.set_ylabel("Magnitude")
         ax.grid(True)
+
         self.fft_canvas.draw()
+
 
     def on_set_gain(self):
         if not self.ensure_connected(): return
@@ -413,8 +632,27 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyleSheet("""
+    QWidget {
+        font-size: 18px;
+    }
+    QPushButton {
+        font-size: 20px;
+        padding: 12px;
+        min-height: 40px;
+    }
+    QLineEdit, QDoubleSpinBox, QSpinBox {
+        font-size: 18px;
+        min-height: 32px;
+    }
+    QTabBar::tab {
+        font-size: 18px;
+        padding: 10px 20px;
+    }
+""")
+
     win = MainWindow()
-    win.resize(1080, 800)
+    win.resize(1980, 1380)
     win.show()
     sys.exit(app.exec_())
 
