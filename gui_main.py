@@ -1,8 +1,8 @@
-# gui_main.py
 import sys
 import struct
 import numpy as np
 import serial
+import time
 
 import matplotlib
 matplotlib.use("Qt5Agg")
@@ -14,14 +14,14 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox,
     QGroupBox, QGridLayout, QMessageBox, QTabWidget, QFormLayout, QButtonGroup
 )
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer
 
 from commands import *               # FS, command IDs
 from serial_comm import send_command
 from adc_stream import read_adc_frame
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
-from scan_kundt import scan_kundt_two_stage, fft_mag_at_freq
+from scan_kundt import fft_mag_at_freq
 
 
 class SerialManager:
@@ -31,7 +31,7 @@ class SerialManager:
     def connect(self, port, baud):
         if self.ser and self.ser.is_open:
             self.ser.close()
-        self.ser = serial.Serial(port, baud, timeout=0.1)
+        self.ser = serial.Serial(port, baud, timeout=0.3)
 
     def disconnect(self):
         if self.ser and self.ser.is_open:
@@ -63,22 +63,15 @@ class MainWindow(QMainWindow):
         self.FS = 20000.0      # default sampling rate
         self.FFT_N = 4096       # default FFT length
 
+        # --- Step-scan synchronization ---
+        self.settle_ms = 80            # wait after each move before sampling (typ. 50–200 ms)
+
         # Zoom parameters
         self.adc_zoom_factor = 15.0
         self.adc_zoom_center = 0
         # Y-axis zoom parameters
         self.y_zoom_factor = 5.0
         self.y_center = 1.65   # midpoint of 0–3.3 V
-
-        self.cont_scan_active = False
-        self.cont_scan_timer = None
-        self.cont_scan_positions = []
-        self.cont_scan_mags = []
-        self.cont_scan_freq = 1000.0  # will be set from UI
-        self.cont_scan_end_mm = 250.0
-
-
-
         self._build_ui()
 
     def _build_ui(self):
@@ -135,7 +128,7 @@ class MainWindow(QMainWindow):
         self.home_offset_spin = QDoubleSpinBox()
         self.home_offset_spin.setRange(-1000.0, 1000.0)
         self.home_offset_spin.setDecimals(3)
-        self.home_offset_spin.setValue(2.9)
+        self.home_offset_spin.setValue(-2.5)
 
         btn_set_home_offset = QPushButton("Set Home Offset (mm)")
         btn_set_home_offset.clicked.connect(self.on_set_home_offset)
@@ -307,19 +300,20 @@ class MainWindow(QMainWindow):
         mode_row_layout = QHBoxLayout(mode_row)
         mode_row_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_mode_live = QPushButton("Live Scan")
-        self.btn_mode_step = QPushButton("Step Scan")
-        self.btn_mode_live.setCheckable(True)
-        self.btn_mode_step.setCheckable(True)
+        self.btn_mode_rms = QPushButton("RMS Scan")
+        self.btn_mode_fft = QPushButton("FFT Scan")
+        self.btn_mode_rms.setCheckable(True)
+        self.btn_mode_fft.setCheckable(True)
 
         self.scan_mode_group = QButtonGroup(self)
         self.scan_mode_group.setExclusive(True)
-        self.scan_mode_group.addButton(self.btn_mode_live, 0)  # 0 = Live
-        self.scan_mode_group.addButton(self.btn_mode_step, 1)  # 1 = Step
-        self.btn_mode_step.setChecked(True)  # default
+        self.scan_mode_group.addButton(self.btn_mode_rms, 0)  # 0 = RMS
+        self.scan_mode_group.addButton(self.btn_mode_fft, 1)  # 1 = FFT
+        self.btn_mode_fft.setChecked(True)  # default
 
-        mode_row_layout.addWidget(self.btn_mode_live)
-        mode_row_layout.addWidget(self.btn_mode_step)
+        mode_row_layout.addWidget(self.btn_mode_rms)
+        mode_row_layout.addWidget(self.btn_mode_fft)
+
         mode_row_layout.addStretch()
         layout.addWidget(mode_row)
 
@@ -343,17 +337,17 @@ class MainWindow(QMainWindow):
         basic_grid.setVerticalSpacing(6)
 
         self.scan_freq_spin = compact_spin(QDoubleSpinBox())
-        self.scan_freq_spin.setRange(1.0, 20_000.0)
+        self.scan_freq_spin.setRange(90.0, 2000.0)
         self.scan_freq_spin.setValue(1000.0)
         self.scan_freq_spin.setDecimals(2)
 
         self.scan_start_spin = compact_spin(QDoubleSpinBox())
         self.scan_start_spin.setRange(0.0, 500.0)
-        self.scan_start_spin.setValue(5.0)
+        self.scan_start_spin.setValue(0.0)
         self.scan_start_spin.setDecimals(2)
 
         self.scan_end_spin = compact_spin(QDoubleSpinBox())
-        self.scan_end_spin.setRange(0.0, 500.0)
+        self.scan_end_spin.setRange(0.0, 900.0)
         self.scan_end_spin.setValue(250.0)
         self.scan_end_spin.setDecimals(2)
 
@@ -365,6 +359,46 @@ class MainWindow(QMainWindow):
         basic_grid.addWidget(self.scan_end_spin,        2, 1)
 
         params_row.addWidget(basic_group, 1)
+
+        # ---- Middle: Acquisition (FS, N, FFT resolution) ----
+        acq_group = QGroupBox("Acquisition")
+        acq_grid = QGridLayout(acq_group)
+        acq_grid.setContentsMargins(8, 8, 8, 8)
+        acq_grid.setHorizontalSpacing(10)
+        acq_grid.setVerticalSpacing(6)
+
+        self.kundt_fs_spin = compact_spin(QDoubleSpinBox())
+        self.kundt_fs_spin.setRange(100.0, 500_000.0)
+        self.kundt_fs_spin.setDecimals(1)
+        self.kundt_fs_spin.setValue(float(getattr(self, "FS", 20000.0)))
+
+        self.kundt_n_spin = compact_spin(QSpinBox())
+        self.kundt_n_spin.setRange(256, 16384)
+        self.kundt_n_spin.setSingleStep(256)
+        self.kundt_n_spin.setValue(int(getattr(self, "FFT_N", 4096)))
+
+        self.lbl_fft_res = QLabel("")  # will be filled by updater
+
+        acq_grid.addWidget(QLabel("Sampling FS (Hz):"), 0, 0)
+        acq_grid.addWidget(self.kundt_fs_spin,         0, 1)
+        acq_grid.addWidget(QLabel("Sample size N:"),   1, 0)
+        acq_grid.addWidget(self.kundt_n_spin,          1, 1)
+        acq_grid.addWidget(QLabel("FFT resolution:"),  2, 0)
+        acq_grid.addWidget(self.lbl_fft_res,           2, 1)
+
+        params_row.addWidget(acq_group, 1)
+
+        def _update_fft_resolution_label():
+            fs = float(self.kundt_fs_spin.value())
+            n = int(self.kundt_n_spin.value())
+            self.FS = fs
+            self.FFT_N = n
+            df = fs / max(n, 1)
+            self.lbl_fft_res.setText(f"Δf = {df:.3f} Hz/bin")
+
+        self.kundt_fs_spin.valueChanged.connect(lambda _=None: _update_fft_resolution_label())
+        self.kundt_n_spin.valueChanged.connect(lambda _=None: _update_fft_resolution_label())
+        _update_fft_resolution_label()
 
         # ---- Right: container that holds Step OR Live group ----
         right_container = QWidget()
@@ -405,62 +439,30 @@ class MainWindow(QMainWindow):
         step_grid.addWidget(self.lbl_finewin,       2, 0)
         step_grid.addWidget(self.fine_window_spin,  2, 1)
 
-        # ---- Live Scan acquisition (Live mode only) ----
-        live_group = QGroupBox("Live Scan Acquisition")
-        live_grid = QGridLayout(live_group)
-        live_grid.setContentsMargins(8, 8, 8, 8)
-        live_grid.setHorizontalSpacing(10)
-        live_grid.setVerticalSpacing(6)
-
-        self.live_fs_spin = compact_spin(QDoubleSpinBox())
-        self.live_fs_spin.setRange(100.0, 500_000.0)
-        self.live_fs_spin.setDecimals(1)
-        self.live_fs_spin.setValue(float(getattr(self, "FS", 20000.0)))
-
-        self.live_n_spin = compact_spin(QSpinBox())
-        self.live_n_spin.setRange(256, 16384)
-        self.live_n_spin.setSingleStep(256)
-        self.live_n_spin.setValue(int(getattr(self, "FFT_N", 4096)))
-
-        live_grid.addWidget(QLabel("Sampling rate FS (Hz):"), 0, 0)
-        live_grid.addWidget(self.live_fs_spin,               0, 1)
-        live_grid.addWidget(QLabel("Sample size N:"),        1, 0)
-        live_grid.addWidget(self.live_n_spin,                1, 1)
-
+        # Put step_group into the right column container
         right_v.addWidget(step_group)
-        right_v.addWidget(live_group)
 
+        # Assemble the two columns into the row, then add to main layout
+        params_row.addWidget(basic_group, 1)
         params_row.addWidget(right_container, 1)
         layout.addLayout(params_row)
+
 
         # ---------------- Action buttons ----------------
         self.btn_run_scan = QPushButton("Run Scan")
         self.btn_run_scan.clicked.connect(self.on_run_scan)
         layout.addWidget(self.btn_run_scan)
 
-        self.btn_cont_start = QPushButton("Start Continuous Scan")
-        self.btn_cont_start.clicked.connect(self.on_start_cont_scan)
-        layout.addWidget(self.btn_cont_start)
-
-        self.btn_cont_stop = QPushButton("Stop Continuous Scan")
-        self.btn_cont_stop.clicked.connect(self.on_stop_cont_scan)
-        layout.addWidget(self.btn_cont_stop)
 
         # ---------------- Plot + results ----------------
         self.kundt_canvas = MplCanvas(self, width=5, height=3)
+        self.kundt_canvas.setMinimumHeight(600)
         layout.addWidget(self.kundt_canvas)
 
         self.scan_result_label = QLabel("Results: -")
         layout.addWidget(self.scan_result_label)
 
         layout.addStretch()
-
-        # ---------------- Mode-dependent visibility ----------------
-        self.step_scan_only_widgets = [step_group, self.btn_run_scan]
-        self.live_scan_only_widgets = [live_group, self.btn_cont_start, self.btn_cont_stop]
-
-        self.scan_mode_group.buttonClicked[int].connect(self.on_scan_mode_changed)
-        self.on_scan_mode_changed(1)  # default Step mode
 
         return w
     # ---------------- Gain tab ----------------
@@ -533,7 +535,7 @@ class MainWindow(QMainWindow):
 
     def on_home(self):
         if not self.ensure_connected(): return
-        send_command(self.serial_mgr.ser, CMD_SET_DIR, bytes([1]))
+        
         status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
         if status != STS_ACK:
             QMessageBox.warning(self, "Home", "Home command failed to start.")
@@ -568,7 +570,6 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
-
 
     def on_set_freq(self):
         if not self.ensure_connected(): return
@@ -821,6 +822,18 @@ class MainWindow(QMainWindow):
         payload = struct.pack("<f", 0.0)
         send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
 
+    def _move_abs_mm(self, pos_mm: float):
+        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", float(pos_mm)))
+        if status != STS_ACK:
+            raise RuntimeError(f"Move failed (to {pos_mm:.2f} mm).")
+        if not wait_until_move_complete(self.serial_mgr.ser):
+            raise RuntimeError(f"Move timeout (to {pos_mm:.2f} mm).")
+    
+    def _settle_after_move(self):
+        """Simple fixed delay after motor move (Option A)."""
+        if self.settle_ms > 0:
+            time.sleep(self.settle_ms / 1000.0)
+
     def get_position_mm(self):
         status, payload = send_command(self.serial_mgr.ser, CMD_GET_POSITION)
         if status != STS_ACK or not payload or len(payload) < 4:
@@ -856,245 +869,245 @@ class MainWindow(QMainWindow):
                 valley_idx.append(i)
 
         return peak_idx, valley_idx
+    
+    def _measure_metric(self, samples: np.ndarray, mode_id: int, f_hz: float) -> float:
+        """
+        mode_id: 0 = RMS, 1 = FFT
+        Returns scalar metric for this position.
+        """
+        samples = np.asarray(samples, dtype=float)
 
-    def _update_kundt_live_plot(self):
-        if not self.cont_scan_positions:
-            return
+        # Convert ADC codes to volts
+        ADC_VREF = 3.3
+        ADC_MAX = 4096.0
+        volts = samples * (ADC_VREF / ADC_MAX)
 
-        ax = self.kundt_canvas.ax
-        ax.clear()
+        # Remove DC
+        volts = volts - np.mean(volts)
 
-        pos = np.array(self.cont_scan_positions, dtype=float)
-        mag = np.array(self.cont_scan_mags, dtype=float)
+        if mode_id == 0:
+            # RMS of AC component
+            return float(np.sqrt(np.mean(volts * volts)))
 
-        ax.plot(pos, mag, label="|P|(live)")
+        # FFT magnitude at selected frequency
+        mag, _ = fft_mag_at_freq(samples, self.FS, f_hz)
+        return float(mag)
 
-        # auto-detect multiple maxima / minima
-        peak_idx, valley_idx = self.find_peaks_and_valleys(pos, mag, min_prominence=0.1)
+    def _scan_range_metric(self, mode_id: int, f_hz: float, x0: float, x1: float, step_mm: float):
+        if step_mm <= 0:
+            raise ValueError("Step must be > 0.")
+        if x1 < x0:
+            x0, x1 = x1, x0
 
-        if peak_idx:
-            ax.scatter(pos[peak_idx], mag[peak_idx], color="red", label="Maxima")
-        if valley_idx:
-            ax.scatter(pos[valley_idx], mag[valley_idx], color="blue", label="Minima")
+        # build positions including end
+        n_steps = int(np.floor((x1 - x0) / step_mm)) + 1
+        pos_list = [x0 + i * step_mm for i in range(max(1, n_steps))]
+        if pos_list[-1] < x1 - 1e-9:
+            pos_list.append(x1)
 
-        ax.set_title("Standing Wave |P| vs Position (Live)")
-        ax.set_xlabel("Position (mm)")
-        ax.set_ylabel("|P| amplitude")
-        ax.grid(True)
-        ax.legend()
+        positions = []
+        metrics = []
 
-        self.kundt_canvas.draw()
+        for pos in pos_list:
+            self._move_abs_mm(pos)
+            QTimer.singleShot(0, lambda: None)  # minimal yield (optional)
+            send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+            samples = read_adc_frame(self.serial_mgr.ser)
+            send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
 
-        # Update text label with count of peaks/minima
-        self.scan_result_label.setText(
-            f"Live peaks: {len(peak_idx)}, minima: {len(valley_idx)}"
-        )
+            if samples is None:
+                raise RuntimeError(f"ADC frame read failed at position {pos:.2f} mm.")
 
-    def on_start_cont_scan(self):
-        if not self.ensure_connected():
-            return
+            metric = self._measure_metric(samples, mode_id, f_hz)
+            positions.append(pos)
+            metrics.append(metric)
 
-        # read parameters from GUI
-        f_hz     = float(self.scan_freq_spin.value())
-        start_mm = float(self.scan_start_spin.value())
-        end_mm   = float(self.scan_end_spin.value())
+        return np.array(positions, dtype=float), np.array(metrics, dtype=float)
 
-        self.cont_scan_freq = f_hz
-        self.cont_scan_end_mm = end_mm
 
-        # reset buffers
-        self.cont_scan_positions = []
-        self.cont_scan_mags = []
-
-        # 1) Home + go to start
+    def _run_step_scan_metric(
+        self,
+        mode_id: int,
+        f_hz: float,
+        start_mm: float,
+        end_mm: float,
+        step_mm: float
+    ):
+        """
+        Homes, moves to start, steps to end.
+        Assumes CMD_STEPPER_MOVE is RELATIVE (as your UI 'Distance (mm)' implies).
+        Returns (positions, metrics).
+        """
+        # Home
         status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
         if status != STS_ACK:
-            QMessageBox.warning(self, "Continuous Scan", "Home failed to start.")
-            return
+            raise RuntimeError("Home failed to start.")
         if not wait_until_home_complete(self.serial_mgr.ser):
-            QMessageBox.warning(self, "Continuous Scan", "Homing timeout.")
-            return
+            raise RuntimeError("Homing timeout.")
 
-        # Move to start_mm once
-        payload = struct.pack("<f", start_mm)
-        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, payload)
+        # Move to start (relative from home)
+        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", float(start_mm)))
         if status != STS_ACK:
-            QMessageBox.warning(self, "Continuous Scan", "Move to start failed.")
-            return
+            raise RuntimeError("Move to start failed.")
         if not wait_until_move_complete(self.serial_mgr.ser):
-            QMessageBox.warning(self, "Continuous Scan", "Move-to-start timeout.")
-            return
+            raise RuntimeError("Move-to-start timeout.")
 
-        # 2) Set excitation tone
-        payload = struct.pack("<f", f_hz)
-        status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+        # Set tone (optional for RMS, but harmless; required for FFT use-case)
+        status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
         if status != STS_ACK:
-            QMessageBox.warning(self, "Continuous Scan", "Failed to set tone.")
-            return
+            raise RuntimeError("Failed to set tone.")
 
-        # 3) Start ADC streaming
-        send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+        positions = []
+        metrics = []
 
-        # 4) Start a long move from start_mm to end_mm (non-blocking on Python side)
-        payload = struct.pack("<f", end_mm)
-        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, payload)
-        if status != STS_ACK:
-            QMessageBox.warning(self, "Continuous Scan", "Scan move failed.")
-            # stop ADC, mute
+        # Build positions list to avoid floating drift
+        if step_mm <= 0:
+            raise ValueError("Step must be > 0.")
+        n_steps = int(np.floor((end_mm - start_mm) / step_mm)) + 1
+        pos_list = [start_mm + i * step_mm for i in range(max(1, n_steps))]
+        if pos_list[-1] < end_mm - 1e-9:
+            pos_list.append(end_mm)  # ensure end included
+
+        # At start position already; measure then step relative
+        for i, pos in enumerate(pos_list):
+            # Allow mechanics to settle before sampling
+            self._settle_after_move()
+            # Capture one frame
+            send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+            samples = read_adc_frame(self.serial_mgr.ser)
             send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
-            self._mute_speaker()
-            return
 
-        # 5) Setup timer to process frames & plot live
-        if self.cont_scan_timer is None:
-            self.cont_scan_timer = QTimer()
-            self.cont_scan_timer.timeout.connect(self.on_cont_scan_tick)
+            if samples is None:
+                raise RuntimeError(f"ADC frame read failed at position {pos:.2f} mm.")
 
-        self.cont_scan_active = True
-        self.cont_scan_timer.start(50)  # every 50 ms
+            metric = self._measure_metric(samples, mode_id, f_hz)
 
-    def on_stop_cont_scan(self):
-        if self.cont_scan_timer:
-            self.cont_scan_timer.stop()
+            positions.append(pos)
+            metrics.append(metric)
 
-        self.cont_scan_active = False
+            # Move to next position (ABSOLUTE)
+            if i < len(pos_list) - 1:
+                next_pos = float(pos_list[i + 1])
+                status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", next_pos))
+                if status != STS_ACK:
+                    raise RuntimeError("Step move failed.")
+                if not wait_until_move_complete(self.serial_mgr.ser):
+                    raise RuntimeError("Step move timeout.")
 
-        # Stop ADC & mute tone
-        send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+
+        # Mute after scan
         self._mute_speaker()
 
-    def on_cont_scan_tick(self):
-        if not self.cont_scan_active:
-            return
+        return np.array(positions, dtype=float), np.array(metrics, dtype=float)
 
-        # 1) Read one ADC frame (blocking until frame available)
-        samples = read_adc_frame(self.serial_mgr.ser)
-        if samples is None:
-            # Could be timeout; you can choose to stop scan or just skip
-            return
-
-        # 2) Get current position from MCU
-        pos_mm = self.get_position_mm()
-        if pos_mm is None:
-            return
-
-        # Stop condition: reached end of scan
-        if pos_mm >= self.cont_scan_end_mm:
-            self.on_stop_cont_scan()
-            return
-
-        # 3) Compute magnitude at excitation frequency
-        mag, f_bin = fft_mag_at_freq(samples, self.FS, self.cont_scan_freq)
-
-        # 4) Append to trace
-        self.cont_scan_positions.append(pos_mm)
-        self.cont_scan_mags.append(mag)
-
-        # 5) Update live standing-wave plot with auto peak detection
-        self._update_kundt_live_plot()
 
     def on_run_scan(self):
         if not self.ensure_connected():
             return
         if self.live_mode:
             self.on_stop_live()
-        if self.cont_scan_active:
-            self.on_stop_cont_scan()
 
         self.serial_mgr.ser.reset_input_buffer()
-        
-        f_hz     = float(self.scan_freq_spin.value())
-        start_mm = float(self.scan_start_spin.value())
-        end_mm   = float(self.scan_end_spin.value())
 
-        coarse_step_mm = float(self.coarse_step_spin.value())
-        fine_step_mm   = float(self.fine_step_spin.value())
-        fine_window_mm = float(self.fine_window_spin.value())
+        mode_id = self.scan_mode_group.checkedId()  # 0=RMS, 1=FFT
 
-        # Turn on tone
-        payload = struct.pack("<f", f_hz)
-        send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, payload)
+        f_hz      = float(self.scan_freq_spin.value())
+        start_mm  = float(self.scan_start_spin.value())
+        end_mm    = float(self.scan_end_spin.value())
 
-        # Run the two-stage scan
+        coarse_mm = float(self.coarse_step_spin.value())
+        fine_mm   = float(self.fine_step_spin.value())
+        fine_win  = float(self.fine_window_spin.value())
+
         try:
-            result = scan_kundt_two_stage(
-                self.serial_mgr.ser,
-                f_hz,
-                start_mm,
-                end_mm,
-                coarse_step_mm,
-                fine_step_mm,
-                fine_window_mm,
-                self.FS    # sampling frequency from GUI
-            )
+            # Home first
+            status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
+            if status != STS_ACK:
+                raise RuntimeError("Home failed to start.")
+            if not wait_until_home_complete(self.serial_mgr.ser):
+                raise RuntimeError("Homing timeout.")
+
+            # Set excitation tone (FFT requires, RMS optional)
+            status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
+            if status != STS_ACK:
+                raise RuntimeError("Failed to set tone.")
+
+            # --------------------
+            # 1) COARSE SCAN
+            # --------------------
+            coarse_pos, coarse_y = self._scan_range_metric(mode_id, f_hz, start_mm, end_mm, coarse_mm)
+
+            i_cmax = int(np.argmax(coarse_y))
+            i_cmin = int(np.argmin(coarse_y))
+            x_cmax = float(coarse_pos[i_cmax])
+            x_cmin = float(coarse_pos[i_cmin])
+
+            # --------------------
+            # 2) FINE SCAN around max and min
+            # --------------------
+            half = fine_win / 2.0
+
+            max_x0 = max(start_mm, x_cmax - half)
+            max_x1 = min(end_mm,   x_cmax + half)
+            min_x0 = max(start_mm, x_cmin - half)
+            min_x1 = min(end_mm,   x_cmin + half)
+
+            fine_max_pos, fine_max_y = self._scan_range_metric(mode_id, f_hz, max_x0, max_x1, fine_mm)
+            fine_min_pos, fine_min_y = self._scan_range_metric(mode_id, f_hz, min_x0, min_x1, fine_mm)
+
+            # refined extrema from fine scans
+            i_fmax = int(np.argmax(fine_max_y))
+            i_fmin = int(np.argmin(fine_min_y))
+
+            Pmax = float(fine_max_y[i_fmax])
+            x_max = float(fine_max_pos[i_fmax])
+
+            Pmin = float(fine_min_y[i_fmin])
+            x_min = float(fine_min_pos[i_fmin])
+
+            Pmin_safe = max(Pmin, 1e-12)
+            SWR = Pmax / Pmin_safe
+            R_mag = (SWR - 1.0) / (SWR + 1.0)
+
         except Exception as e:
             QMessageBox.warning(self, "Scan Error", str(e))
             self._mute_speaker()
             return
+        finally:
+            # Always mute tone at the end
+            self._mute_speaker()
 
-        # Turn tone off
-        self._mute_speaker()
-
-        # ----------------------------
-        # Extract results
-        # ----------------------------
-
-        coarse_pos = result["coarse_positions"]
-        coarse_mag = result["coarse_mag"]
-
-        fine_max_pos = result["fine_max_positions"]
-        fine_max_mag = result["fine_max_mag"]
-
-        fine_min_pos = result["fine_min_positions"]
-        fine_min_mag = result["fine_min_mag"]
-
-        # Find fine max/min
-        idx_fmax = int(np.argmax(fine_max_mag))
-        idx_fmin = int(np.argmin(fine_min_mag))
-
-        real_pmax = fine_max_mag[idx_fmax]
-        real_pmax_x = fine_max_pos[idx_fmax]
-
-        real_pmin = fine_min_mag[idx_fmin]
-        real_pmin_x = fine_min_pos[idx_fmin]
-
-        # Compute SWR
-        p_min_safe = max(real_pmin, 1e-9)
-        SWR = real_pmax / p_min_safe
-        R_mag = (SWR - 1.0) / (SWR + 1.0)
-
-        # Output summary
+        mode_name = "RMS" if mode_id == 0 else "FFT"
         self.scan_result_label.setText(
-            f"Coarse peak≈ {coarse_pos[np.argmax(coarse_mag)]:.1f} mm | "
-            f"Refined Pmax={real_pmax:.3f} at {real_pmax_x:.2f} mm, "
-            f"Pmin={real_pmin:.3f} at {real_pmin_x:.2f} mm, "
-            f"SWR={SWR:.3f}, |R|={R_mag:.3f}"
+            f"{mode_name} Two-Stage Scan\n"
+            f"Coarse max≈ {x_cmax:.2f} mm, coarse min≈ {x_cmin:.2f} mm\n"
+            f"Refined Pmax={Pmax:.6g} at {x_max:.2f} mm\n"
+            f"Refined Pmin={Pmin:.6g} at {x_min:.2f} mm\n"
+            f"SWR={SWR:.3f}\n|R|={R_mag:.3f}"
         )
 
-        # ----------------------------
-        # Plot coarse + fine scans
-        # ----------------------------
+        # --------------------
+        # Plot
+        # --------------------
         ax = self.kundt_canvas.ax
         ax.clear()
 
-        # coarse curve
-        ax.plot(coarse_pos, coarse_mag, "k--", label="Coarse scan")
+        ax.plot(coarse_pos, coarse_y, "k--", label="Coarse")
+        ax.plot(fine_max_pos, fine_max_y, "r-", label="Fine (around max)")
+        ax.plot(fine_min_pos, fine_min_y, "b-", label="Fine (around min)")
 
-        # fine scans
-        ax.plot(fine_max_pos, fine_max_mag, "r-", label="Fine region (Pmax)")
-        ax.plot(fine_min_pos, fine_min_mag, "b-", label="Fine region (Pmin)")
+        ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
+        ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
 
-        # markers
-        ax.scatter([real_pmax_x], [real_pmax], c="red", s=80)
-        ax.scatter([real_pmin_x], [real_pmin], c="blue", s=80)
-
-        ax.set_title("Two-stage Kundt Scan")
+        ax.set_title(f"Two-Stage Step Scan ({mode_name})")
         ax.set_xlabel("Position (mm)")
-        ax.set_ylabel("|P| amplitude")
+        ax.set_ylabel("Metric")
         ax.grid(True)
         ax.legend()
 
         self.kundt_canvas.draw()
+
+
 
 def main():
     app = QApplication(sys.argv)
@@ -1119,7 +1132,7 @@ def main():
 """)
 
     win = MainWindow()
-    win.resize(1980, 1380)
+    win.resize(2200, 1380)
     win.show()
     sys.exit(app.exec_())
 
