@@ -12,16 +12,16 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox,
-    QGroupBox, QGridLayout, QMessageBox, QTabWidget, QFormLayout
+    QGroupBox, QGridLayout, QMessageBox, QTabWidget, QFormLayout, QButtonGroup
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 
 from commands import *               # FS, command IDs
 from serial_comm import send_command
 from adc_stream import read_adc_frame
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
-from scan_kundt import *    # <-- use shared backend scan
+from scan_kundt import scan_kundt_two_stage, fft_mag_at_freq
 
 
 class SerialManager:
@@ -59,7 +59,6 @@ class MainWindow(QMainWindow):
         self.last_samples = None
         self.live_mode = False
         self.live_timer = None
-
 
         self.FS = 20000.0      # default sampling rate
         self.FFT_N = 4096       # default FFT length
@@ -132,11 +131,22 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.move_spin, 1, 1)
         grid.addWidget(btn_move, 1, 2)
 
-    
+        # --- Home offset controls ---
+        self.home_offset_spin = QDoubleSpinBox()
+        self.home_offset_spin.setRange(-1000.0, 1000.0)
+        self.home_offset_spin.setDecimals(3)
+        self.home_offset_spin.setValue(2.9)
+
+        btn_set_home_offset = QPushButton("Set Home Offset (mm)")
+        btn_set_home_offset.clicked.connect(self.on_set_home_offset)
+
+        grid.addWidget(QLabel("Home offset (mm):"), 3, 0)
+        grid.addWidget(self.home_offset_spin, 3, 1)
+        grid.addWidget(btn_set_home_offset, 3, 2)
 
         btn_home = QPushButton("Home Motor")
         btn_home.clicked.connect(self.on_home)
-        grid.addWidget(btn_home, 3, 0)
+        grid.addWidget(btn_home, 4, 0)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -292,66 +302,151 @@ class MainWindow(QMainWindow):
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        form = QFormLayout()
-        self.scan_freq_spin = QDoubleSpinBox()
+        # ---------------- Scan mode buttons (top) ----------------
+        mode_row = QWidget()
+        mode_row_layout = QHBoxLayout(mode_row)
+        mode_row_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.btn_mode_live = QPushButton("Live Scan")
+        self.btn_mode_step = QPushButton("Step Scan")
+        self.btn_mode_live.setCheckable(True)
+        self.btn_mode_step.setCheckable(True)
+
+        self.scan_mode_group = QButtonGroup(self)
+        self.scan_mode_group.setExclusive(True)
+        self.scan_mode_group.addButton(self.btn_mode_live, 0)  # 0 = Live
+        self.scan_mode_group.addButton(self.btn_mode_step, 1)  # 1 = Step
+        self.btn_mode_step.setChecked(True)  # default
+
+        mode_row_layout.addWidget(self.btn_mode_live)
+        mode_row_layout.addWidget(self.btn_mode_step)
+        mode_row_layout.addStretch()
+        layout.addWidget(mode_row)
+
+        # ---------------- Compact widget helper ----------------
+        def compact_spin(spin):
+            spin.setFixedHeight(28)
+            spin.setMinimumWidth(150)
+            spin.setStyleSheet("padding: 2px;")
+            return spin
+
+        # ---------------- Two-column parameter row ----------------
+        params_row = QHBoxLayout()
+        params_row.setContentsMargins(0, 0, 0, 0)
+        params_row.setSpacing(12)
+
+        # ---- Left: Scan Range (always visible) ----
+        basic_group = QGroupBox("Scan Range")
+        basic_grid = QGridLayout(basic_group)
+        basic_grid.setContentsMargins(8, 8, 8, 8)
+        basic_grid.setHorizontalSpacing(10)
+        basic_grid.setVerticalSpacing(6)
+
+        self.scan_freq_spin = compact_spin(QDoubleSpinBox())
         self.scan_freq_spin.setRange(1.0, 20_000.0)
         self.scan_freq_spin.setValue(1000.0)
+        self.scan_freq_spin.setDecimals(2)
 
-        self.scan_start_spin = QDoubleSpinBox()
+        self.scan_start_spin = compact_spin(QDoubleSpinBox())
         self.scan_start_spin.setRange(0.0, 500.0)
         self.scan_start_spin.setValue(5.0)
+        self.scan_start_spin.setDecimals(2)
 
-        self.scan_end_spin = QDoubleSpinBox()
+        self.scan_end_spin = compact_spin(QDoubleSpinBox())
         self.scan_end_spin.setRange(0.0, 500.0)
         self.scan_end_spin.setValue(250.0)
+        self.scan_end_spin.setDecimals(2)
 
-        # --- New GUI fields for coarse/fine scanning ---
-        self.coarse_step_spin = QDoubleSpinBox()
+        basic_grid.addWidget(QLabel("Frequency (Hz):"), 0, 0)
+        basic_grid.addWidget(self.scan_freq_spin,       0, 1)
+        basic_grid.addWidget(QLabel("Start (mm):"),     1, 0)
+        basic_grid.addWidget(self.scan_start_spin,      1, 1)
+        basic_grid.addWidget(QLabel("End (mm):"),       2, 0)
+        basic_grid.addWidget(self.scan_end_spin,        2, 1)
+
+        params_row.addWidget(basic_group, 1)
+
+        # ---- Right: container that holds Step OR Live group ----
+        right_container = QWidget()
+        right_v = QVBoxLayout(right_container)
+        right_v.setContentsMargins(0, 0, 0, 0)
+        right_v.setSpacing(0)
+
+        # ---- Step Scan parameters (Step mode only) ----
+        step_group = QGroupBox("Step Scan Parameters")
+        step_grid = QGridLayout(step_group)
+        step_grid.setContentsMargins(8, 8, 8, 8)
+        step_grid.setHorizontalSpacing(10)
+        step_grid.setVerticalSpacing(6)
+
+        self.coarse_step_spin = compact_spin(QDoubleSpinBox())
         self.coarse_step_spin.setRange(0.1, 100.0)
-        self.coarse_step_spin.setValue(10.0)
+        self.coarse_step_spin.setValue(5.0)
         self.coarse_step_spin.setDecimals(2)
 
-        self.fine_step_spin = QDoubleSpinBox()
+        self.fine_step_spin = compact_spin(QDoubleSpinBox())
         self.fine_step_spin.setRange(0.01, 10.0)
         self.fine_step_spin.setValue(1.0)
         self.fine_step_spin.setDecimals(3)
 
-        self.fine_window_spin = QDoubleSpinBox()
+        self.fine_window_spin = compact_spin(QDoubleSpinBox())
         self.fine_window_spin.setRange(1.0, 100.0)
         self.fine_window_spin.setValue(10.0)
         self.fine_window_spin.setDecimals(2)
 
-        form.addRow("Coarse step (mm):", self.coarse_step_spin)
-        form.addRow("Fine step (mm):",   self.fine_step_spin)
-        form.addRow("Fine window (mm):", self.fine_window_spin)
+        self.lbl_coarse   = QLabel("Coarse step (mm):")
+        self.lbl_finestep = QLabel("Fine step (mm):")
+        self.lbl_finewin  = QLabel("Fine window (mm):")
 
+        step_grid.addWidget(self.lbl_coarse,        0, 0)
+        step_grid.addWidget(self.coarse_step_spin,  0, 1)
+        step_grid.addWidget(self.lbl_finestep,      1, 0)
+        step_grid.addWidget(self.fine_step_spin,    1, 1)
+        step_grid.addWidget(self.lbl_finewin,       2, 0)
+        step_grid.addWidget(self.fine_window_spin,  2, 1)
 
-        #self.scan_step_spin = QDoubleSpinBox()
-        #self.scan_step_spin.setRange(0.1, 50.0)
-        #self.scan_step_spin.setValue(5.0)
+        # ---- Live Scan acquisition (Live mode only) ----
+        live_group = QGroupBox("Live Scan Acquisition")
+        live_grid = QGridLayout(live_group)
+        live_grid.setContentsMargins(8, 8, 8, 8)
+        live_grid.setHorizontalSpacing(10)
+        live_grid.setVerticalSpacing(6)
 
-        form.addRow("Frequency (Hz):", self.scan_freq_spin)
-        form.addRow("Start (mm):", self.scan_start_spin)
-        form.addRow("End (mm):", self.scan_end_spin)
-        #form.addRow("Step (mm):", self.scan_step_spin)
+        self.live_fs_spin = compact_spin(QDoubleSpinBox())
+        self.live_fs_spin.setRange(100.0, 500_000.0)
+        self.live_fs_spin.setDecimals(1)
+        self.live_fs_spin.setValue(float(getattr(self, "FS", 20000.0)))
 
-        layout.addLayout(form)
+        self.live_n_spin = compact_spin(QSpinBox())
+        self.live_n_spin.setRange(256, 16384)
+        self.live_n_spin.setSingleStep(256)
+        self.live_n_spin.setValue(int(getattr(self, "FFT_N", 4096)))
 
-        btn_run_scan = QPushButton("Run Scan")
-        btn_run_scan.clicked.connect(self.on_run_scan)
-        layout.addWidget(btn_run_scan)
+        live_grid.addWidget(QLabel("Sampling rate FS (Hz):"), 0, 0)
+        live_grid.addWidget(self.live_fs_spin,               0, 1)
+        live_grid.addWidget(QLabel("Sample size N:"),        1, 0)
+        live_grid.addWidget(self.live_n_spin,                1, 1)
 
-        # --- New continuous scan controls ---
-        btn_cont_start = QPushButton("Start Continuous Scan")
-        btn_cont_start.clicked.connect(self.on_start_cont_scan)
+        right_v.addWidget(step_group)
+        right_v.addWidget(live_group)
 
-        btn_cont_stop = QPushButton("Stop Continuous Scan")
-        btn_cont_stop.clicked.connect(self.on_stop_cont_scan)
+        params_row.addWidget(right_container, 1)
+        layout.addLayout(params_row)
 
-        layout.addWidget(btn_cont_start)
-        layout.addWidget(btn_cont_stop)
+        # ---------------- Action buttons ----------------
+        self.btn_run_scan = QPushButton("Run Scan")
+        self.btn_run_scan.clicked.connect(self.on_run_scan)
+        layout.addWidget(self.btn_run_scan)
 
+        self.btn_cont_start = QPushButton("Start Continuous Scan")
+        self.btn_cont_start.clicked.connect(self.on_start_cont_scan)
+        layout.addWidget(self.btn_cont_start)
 
+        self.btn_cont_stop = QPushButton("Stop Continuous Scan")
+        self.btn_cont_stop.clicked.connect(self.on_stop_cont_scan)
+        layout.addWidget(self.btn_cont_stop)
+
+        # ---------------- Plot + results ----------------
         self.kundt_canvas = MplCanvas(self, width=5, height=3)
         layout.addWidget(self.kundt_canvas)
 
@@ -359,8 +454,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.scan_result_label)
 
         layout.addStretch()
-        return w
 
+        # ---------------- Mode-dependent visibility ----------------
+        self.step_scan_only_widgets = [step_group, self.btn_run_scan]
+        self.live_scan_only_widgets = [live_group, self.btn_cont_start, self.btn_cont_stop]
+
+        self.scan_mode_group.buttonClicked[int].connect(self.on_scan_mode_changed)
+        self.on_scan_mode_changed(1)  # default Step mode
+
+        return w
     # ---------------- Gain tab ----------------
     def _build_gain_tab(self):
         w = QWidget()
@@ -431,6 +533,7 @@ class MainWindow(QMainWindow):
 
     def on_home(self):
         if not self.ensure_connected(): return
+        send_command(self.serial_mgr.ser, CMD_SET_DIR, bytes([1]))
         status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
         if status != STS_ACK:
             QMessageBox.warning(self, "Home", "Home command failed to start.")
@@ -439,6 +542,33 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Home", "Homing timeout.")
         else:
             QMessageBox.information(self, "Home", "Homing complete.")
+    def set_home_offset_mm(self, offset_mm: float):
+        payload = struct.pack("<f", float(offset_mm))
+        status, _ = send_command(self.serial_mgr.ser, CMD_SET_HOME_OFFSET, payload)
+        if status != STS_ACK:
+            raise RuntimeError("SET_HOME_OFFSET failed")
+
+    def get_home_offset_mm(self) -> float:
+        status, payload = send_command(self.serial_mgr.ser, CMD_GET_HOME_OFFSET)
+        if status != STS_ACK or payload is None or len(payload) != 4:
+            raise RuntimeError("GET_HOME_OFFSET failed")
+        return struct.unpack("<f", payload)[0]
+    
+    def on_set_home_offset(self):
+        if not self.ensure_connected():
+            return
+
+        try:
+            offset = float(self.home_offset_spin.value())
+            self.set_home_offset_mm(offset)
+            QMessageBox.information(
+                self,
+                "Home Offset",
+                f"Home offset set to {offset:.3f} mm"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
 
     def on_set_freq(self):
         if not self.ensure_connected(): return
@@ -481,6 +611,7 @@ class MainWindow(QMainWindow):
         self.last_samples = samples
         self._update_time_plot(samples)
         self._update_fft_plot(samples)
+    
     
     def on_live_update(self):
         if not self.live_mode:
@@ -571,6 +702,18 @@ class MainWindow(QMainWindow):
         self.y_zoom_factor = 1.0
         if self.last_samples is not None:
             self._update_time_plot(self.last_samples)
+
+    def on_scan_mode_changed(self, mode_id: int):
+        """
+        mode_id: 0 = Live Scan, 1 = Step Scan
+        """
+        is_live = (mode_id == 0)
+
+        for w in self.step_scan_only_widgets:
+            w.setVisible(not is_live)   # show only in Step Scan
+
+        for w in self.live_scan_only_widgets:
+            w.setVisible(is_live)       # show only in Live Scan
 
 
     def _update_time_plot(self, samples):
@@ -841,7 +984,6 @@ class MainWindow(QMainWindow):
             return
 
         # 3) Compute magnitude at excitation frequency
-        from scan_kundt import fft_mag_at_freq  # if not already imported
         mag, f_bin = fft_mag_at_freq(samples, self.FS, self.cont_scan_freq)
 
         # 4) Append to trace
@@ -854,7 +996,13 @@ class MainWindow(QMainWindow):
     def on_run_scan(self):
         if not self.ensure_connected():
             return
+        if self.live_mode:
+            self.on_stop_live()
+        if self.cont_scan_active:
+            self.on_stop_cont_scan()
 
+        self.serial_mgr.ser.reset_input_buffer()
+        
         f_hz     = float(self.scan_freq_spin.value())
         start_mm = float(self.scan_start_spin.value())
         end_mm   = float(self.scan_end_spin.value())

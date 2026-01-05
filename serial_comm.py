@@ -15,7 +15,7 @@ def build_frame(cmd: int, payload: bytes = b'') -> bytes:
     crc = crc16_arc(body)
     return header + body + struct.pack("<H", crc)
 
-def read_frame(ser, timeout=1.0):
+def read_frame(ser, timeout=2.0):
     start = time.time()
     buf = bytearray()
 
