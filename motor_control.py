@@ -4,7 +4,7 @@ import time
 from serial_comm import send_command
 from commands import CMD_HOME, CMD_STEPPER_MOVE, STS_ACK
 
-def wait_until_home_complete(ser, timeout=30.0):
+def wait_until_home_complete(ser, timeout=60.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
         status, _ = send_command(ser, 0x32)   # CMD_HOME_STATUS
@@ -13,7 +13,7 @@ def wait_until_home_complete(ser, timeout=30.0):
         time.sleep(0.05)
     return False
 
-def wait_until_move_complete(ser, timeout=30.0):
+def wait_until_move_complete(ser, timeout=60.0):
     t0 = time.time()
     while time.time() - t0 < timeout:
         status, _ = send_command(ser, 0x33)   # CMD_MOVE_STATUS
