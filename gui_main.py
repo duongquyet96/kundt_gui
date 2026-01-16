@@ -10,15 +10,16 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox,
-    QGroupBox, QGridLayout, QMessageBox, QTabWidget, QFormLayout, QButtonGroup
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QDialog, QGridLayout, QComboBox,
+    QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QAction, QActionGroup, QMenuBar,
+    QGroupBox, QGridLayout, QMessageBox, QTabWidget, QButtonGroup, QAction, QFileDialog, QMessageBox
 )
+from PyQt5.QtSerialPort import QSerialPortInfo
 from PyQt5.QtCore import Qt, QTimer
 
 from commands import *               # FS, command IDs
 from serial_comm import send_command
-from adc_stream import read_adc_frame
+from adc_stream import read_adc_frame, read_packet
 from motor_control import wait_until_move_complete, wait_until_home_complete
 from digipot import digipot_set
 from scan_kundt import fft_mag_at_freq
@@ -49,11 +50,54 @@ class MplCanvas(FigureCanvas):
         super().__init__(fig)
         self.setParent(parent)
 
+class ScanResultDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scan Results")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+        grid = QGridLayout()
+
+        self.labels = {}
+
+        fields = [
+            ("Mode", "mode"),
+            ("Pmax", "Pmax"),
+            ("Pmax position (mm)", "x_max"),
+            ("Pmin", "Pmin"),
+            ("Pmin position (mm)", "x_min"),
+            ("SWR", "SWR"),
+            ("|R|", "R"),
+            ("Points", "points"),
+        ]
+
+        for row, (title, key) in enumerate(fields):
+            lbl_title = QLabel(f"{title}:")
+            lbl_value = QLabel("-")
+            lbl_title.setStyleSheet("font-weight: bold;")
+            grid.addWidget(lbl_title, row, 0)
+            grid.addWidget(lbl_value, row, 1)
+            self.labels[key] = lbl_value
+
+        layout.addLayout(grid)
+
+    def update_results(self, results: dict):
+        if not results:
+            return
+
+        for key, lbl in self.labels.items():
+            if key in results:
+                val = results[key]
+                if isinstance(val, float):
+                    lbl.setText(f"{val:.6g}")
+                else:
+                    lbl.setText(str(val))
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-
+        self.selected_port = None
         self.setWindowTitle("Kundt Tube Controller GUI")
         self.serial_mgr = SerialManager()
         self.last_samples = None
@@ -64,7 +108,7 @@ class MainWindow(QMainWindow):
         self.FFT_N = 4096       # default FFT length
 
         # --- Step-scan synchronization ---
-        self.settle_ms = 80            # wait after each move before sampling (typ. 50–200 ms)
+        self.settle_ms = 50            # wait after each move before sampling (typ. 50–200 ms)
 
         # Zoom parameters
         self.adc_zoom_factor = 15.0
@@ -72,30 +116,215 @@ class MainWindow(QMainWindow):
         # Y-axis zoom parameters
         self.y_zoom_factor = 5.0
         self.y_center = 1.65   # midpoint of 0–3.3 V
+
+        self.pulses_per_mm = 3200.0 / (np.pi * 14.0)  # temporary: match MCU
+        self.tim3_psc = 840 - 1
+        self.tim3_arr = 24
+
+        self.last_scan_results = None
+
         self._build_ui()
+        self._build_menubar()
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.showNormal()
+
+    def _refresh_com_ports(self):
+            self.port_combo.clear()
+
+            ports = QSerialPortInfo.availablePorts()
+            for port in ports:
+                # Show user-friendly name, keep system port internally
+                self.port_combo.addItem(
+                    f"{port.portName()} — {port.description()}",
+                    port.portName()
+                )
+
+            if self.port_combo.count() == 0:
+                self.port_combo.addItem("No ports found", None)
+                self.port_combo.setEnabled(False)
+            else:
+                self.port_combo.setEnabled(True)
+
+    def _build_menubar(self):
+        menubar = self.menuBar()  # QMainWindow built-in
+
+        # Example standard menus
+        file_menu = menubar.addMenu("File")
+        edit_menu = menubar.addMenu("Edit")
+
+        # Connect menu (what you asked for)
+        connect_menu = menubar.addMenu("Connect")
+
+        # Submenu: Ports
+        self.ports_menu = connect_menu.addMenu("Port")
+
+        # Make ports mutually exclusive (radio behavior)
+        self.port_action_group = QActionGroup(self)
+        self.port_action_group.setExclusive(True)
+
+        # Refresh ports
+        refresh_ports_action = QAction("Refresh Ports", self)
+        refresh_ports_action.triggered.connect(self._refresh_ports_menu)
+        connect_menu.addAction(refresh_ports_action)
+
+        connect_menu.addSeparator()
+
+        # Connect / Disconnect actions
+        self.connect_action = QAction("Connect", self)
+        self.connect_action.triggered.connect(self.on_connect)
+
+        self.disconnect_action = QAction("Disconnect", self)
+        self.disconnect_action.triggered.connect(self.on_disconnect)
+
+        connect_menu.addAction(self.connect_action)
+        connect_menu.addAction(self.disconnect_action)
+
+        # Initial population
+        self._refresh_ports_menu()
+
+    def _refresh_ports_menu(self):
+        self.ports_menu.clear()
+        for a in list(self.port_action_group.actions()):
+            self.port_action_group.removeAction(a)
+
+        ports = QSerialPortInfo.availablePorts()
+
+        if not ports:
+            no_ports = QAction("No ports found", self)
+            no_ports.setEnabled(False)
+            self.ports_menu.addAction(no_ports)
+            self.selected_port = None
+            return
+
+        # Populate ports as checkable actions
+        for p in ports:
+            label = p.portName()
+            desc = p.description().strip()
+            if desc:
+                label += f" — {desc}"
+
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setData(p.portName())  # store "COMx"
+            act.triggered.connect(self._on_port_selected)
+
+            self.port_action_group.addAction(act)
+            self.ports_menu.addAction(act)
+
+        # Auto-select:
+        # 1) keep current selection if still present
+        # 2) else select first port
+        selected = None
+        if self.selected_port:
+            for act in self.port_action_group.actions():
+                if act.data() == self.selected_port:
+                    selected = act
+                    break
+
+        if selected is None:
+            selected = self.port_action_group.actions()[0]
+            self.selected_port = selected.data()
+
+        selected.setChecked(True)
+
+    def _on_port_selected(self):
+        act = self.sender()
+        if act is None:
+            return
+        self.selected_port = act.data()
+  
+    def _build_menubar(self):
+            menubar = self.menuBar()  # QMainWindow built-in
+
+            # Example standard menus
+            file_menu = menubar.addMenu("File")
+            save_kundt_action = QAction("Save Kundt Scan…", self)
+            save_kundt_action.triggered.connect(self.on_save_kundt_scan)
+
+            file_menu.addAction(save_kundt_action)
+            edit_menu = menubar.addMenu("Edit")
+
+            # Connect menu (what you asked for)
+            connect_menu = menubar.addMenu("Connect")
+
+            # Submenu: Ports
+            self.ports_menu = connect_menu.addMenu("Port")
+
+            # Make ports mutually exclusive (radio behavior)
+            self.port_action_group = QActionGroup(self)
+            self.port_action_group.setExclusive(True)
+
+            # Refresh ports
+            refresh_ports_action = QAction("Refresh Ports", self)
+            refresh_ports_action.triggered.connect(self._refresh_ports_menu)
+            connect_menu.addAction(refresh_ports_action)
+
+            connect_menu.addSeparator()
+
+            # Connect / Disconnect actions
+            self.connect_action = QAction("Connect", self)
+            self.connect_action.triggered.connect(self.on_connect)
+
+            self.disconnect_action = QAction("Disconnect", self)
+            self.disconnect_action.triggered.connect(self.on_disconnect)
+
+            connect_menu.addAction(self.connect_action)
+            connect_menu.addAction(self.disconnect_action)
+
+            # Initial population
+            self._refresh_ports_menu()
+
+    def on_save_kundt_scan(self):
+        if not hasattr(self, "kundt_canvas"):
+            QMessageBox.warning(self, "Save", "No Kundt plot available.")
+            return
+
+        # Ask user for filename
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Kundt Scan",
+            "kundt_scan.png",
+            "PNG Image (*.png)"
+        )
+
+        if not path:
+            return  # user cancelled
+
+        try:
+            # Save plot
+            self.kundt_canvas.figure.savefig(
+                path,
+                dpi=300,
+                bbox_inches="tight"
+            )
+
+            # Optional: save numeric results next to the image
+            if hasattr(self, "last_scan_results"):
+                import json, os
+                base, _ = os.path.splitext(path)
+                data_path = base + ".json"
+
+                with open(data_path, "w") as f:
+                    json.dump(self.last_scan_results, f, indent=2)
+
+            QMessageBox.information(
+                self,
+                "Save",
+                f"Kundt scan saved successfully:\n{path}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not save Kundt scan:\n{e}"
+            )
 
     def _build_ui(self):
         central = QWidget()
         main_layout = QVBoxLayout(central)
-
-        # Connection
-        conn_group = QGroupBox("Connection")
-        conn_layout = QHBoxLayout()
-        self.port_edit = QLineEdit("COM5")
-
-        self.connect_btn = QPushButton("Connect")
-        self.disconnect_btn = QPushButton("Disconnect")
-
-        self.connect_btn.clicked.connect(self.on_connect)
-        self.disconnect_btn.clicked.connect(self.on_disconnect)
-
-        conn_layout.addWidget(QLabel("Port:"))
-        conn_layout.addWidget(self.port_edit)
-
-        conn_layout.addWidget(self.connect_btn)
-        conn_layout.addWidget(self.disconnect_btn)
-        conn_group.setLayout(conn_layout)
-        main_layout.addWidget(conn_group)
 
         # Tabs
         tabs = QTabWidget()
@@ -150,8 +379,10 @@ class MainWindow(QMainWindow):
         w = QWidget()
         layout = QVBoxLayout(w)
 
+        # ---------------- Signal Generator ----------------
         freq_group = QGroupBox("Signal Generator (AD9833)")
-        fg_layout = QHBoxLayout()
+        fg_layout = QHBoxLayout(freq_group)
+
         self.freq_spin = QDoubleSpinBox()
         self.freq_spin.setRange(0.0, 12_000_000.0)
         self.freq_spin.setDecimals(2)
@@ -167,27 +398,21 @@ class MainWindow(QMainWindow):
         fg_layout.addWidget(self.freq_spin)
         fg_layout.addWidget(btn_set_freq)
         fg_layout.addWidget(btn_mute)
-        
-        freq_group.setLayout(fg_layout)
-        layout.addWidget(freq_group)
 
-        # ---------------- FFT Settings -----------------
+        # ---------------- FFT Settings ----------------
         fft_group = QGroupBox("FFT Settings")
-        fft_layout = QHBoxLayout()
+        fft_layout = QHBoxLayout(fft_group)
 
-        # Sampling frequency input (FS)
         self.fs_spin = QDoubleSpinBox()
         self.fs_spin.setRange(100.0, 500000.0)
-        self.fs_spin.setValue(20000.0)  # default FS = 100 kHz
+        self.fs_spin.setValue(20000.0)
         self.fs_spin.setDecimals(1)
 
-        # FFT size (N)
         self.fft_n_spin = QSpinBox()
         self.fft_n_spin.setRange(256, 16384)
         self.fft_n_spin.setSingleStep(256)
         self.fft_n_spin.setValue(4096)
 
-        # Apply button
         btn_apply_fft = QPushButton("Apply FFT Settings")
         btn_apply_fft.clicked.connect(self.on_apply_fft_settings)
 
@@ -197,27 +422,54 @@ class MainWindow(QMainWindow):
         fft_layout.addWidget(self.fft_n_spin)
         fft_layout.addWidget(btn_apply_fft)
 
-        fft_group.setLayout(fft_layout)
-        layout.addWidget(fft_group)
-
+        # ---------------- ADC / Capture (RIGHT SIDE) ----------------
         adc_group = QGroupBox("ADC / Capture")
-        adc_layout = QHBoxLayout()
-        #btn_capture = QPushButton("Capture Frame")
-        #btn_capture.clicked.connect(self.on_capture_frame)
-        #adc_layout.addWidget(btn_capture)
-        adc_group.setLayout(adc_layout)
-        layout.addWidget(adc_group)
+        adc_layout = QHBoxLayout(adc_group)
 
         btn_live_start = QPushButton("Start Live View")
         btn_live_start.clicked.connect(self.on_start_live)
+        btn_live_start.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #2e7d32;"
+            "  color: white;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:disabled {"
+            "  background-color: #a5d6a7;"
+            "  color: #eeeeee;"
+            "}"
+        )
+
 
         btn_live_stop = QPushButton("Stop Live View")
         btn_live_stop.clicked.connect(self.on_stop_live)
-
+        btn_live_stop.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #c62828;"
+            "  color: white;"
+            "  font-weight: bold;"
+            "}"
+            "QPushButton:disabled {"
+            "  background-color: #ef9a9a;"
+            "  color: #eeeeee;"
+            "}"
+        )
         adc_layout.addWidget(btn_live_start)
         adc_layout.addWidget(btn_live_stop)
 
+        # ================= TOP ROW: left stack + right group =================
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
 
+        left_stack = QVBoxLayout()
+        left_stack.setSpacing(10)
+        left_stack.addWidget(freq_group)
+        left_stack.addWidget(fft_group)
+
+        top_row.addLayout(left_stack, stretch=1)
+        top_row.addWidget(adc_group, stretch=0)
+
+        layout.addLayout(top_row)
         # ---------- Zoom Controls (Right Side) ----------
         zoom_panel = QWidget()
         zoom_layout = QVBoxLayout(zoom_panel)
@@ -289,7 +541,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.fft_canvas)
         layout.addStretch()
         return w
-
     # ---------------- Kundt scan tab ----------------
     def _build_kundt_tab(self):
         w = QWidget()
@@ -301,17 +552,21 @@ class MainWindow(QMainWindow):
         mode_row_layout.setContentsMargins(0, 0, 0, 0)
 
         self.btn_mode_rms = QPushButton("RMS Scan")
-        self.btn_mode_fft = QPushButton("FFT Scan")
-        self.btn_mode_rms.setCheckable(True)
-        self.btn_mode_fft.setCheckable(True)
+        self.btn_mode_rms_cont = QPushButton("RMS Scan Fast")
+        self.btn_mode_fft      = QPushButton("FFT Scan")
+        
+        for b in (self.btn_mode_rms, self.btn_mode_rms_cont, self.btn_mode_fft):
+            b.setCheckable(True)
 
         self.scan_mode_group = QButtonGroup(self)
         self.scan_mode_group.setExclusive(True)
         self.scan_mode_group.addButton(self.btn_mode_rms, 0)  # 0 = RMS
-        self.scan_mode_group.addButton(self.btn_mode_fft, 1)  # 1 = FFT
+        self.scan_mode_group.addButton(self.btn_mode_rms_cont, 1)  # RMS continuous
+        self.scan_mode_group.addButton(self.btn_mode_fft, 2)  # 1 = FFT
         self.btn_mode_fft.setChecked(True)  # default
 
         mode_row_layout.addWidget(self.btn_mode_rms)
+        mode_row_layout.addWidget(self.btn_mode_rms_cont)
         mode_row_layout.addWidget(self.btn_mode_fft)
 
         mode_row_layout.addStretch()
@@ -366,6 +621,24 @@ class MainWindow(QMainWindow):
         acq_grid.setContentsMargins(8, 8, 8, 8)
         acq_grid.setHorizontalSpacing(10)
         acq_grid.setVerticalSpacing(6)
+
+        self.rms_win_spin = QSpinBox()
+        self.rms_win_spin.setRange(128, 16384)
+        self.rms_win_spin.setSingleStep(128)
+        self.rms_win_spin.setValue(1024)
+
+        self.rms_hop_spin = QSpinBox()
+        self.rms_hop_spin.setRange(64, 16384)
+        self.rms_hop_spin.setSingleStep(64)
+        self.rms_hop_spin.setValue(218)
+
+        acq_grid.addWidget(QLabel("RMS window N:"), 0, 2)
+        acq_grid.addWidget(self.rms_win_spin,       0, 3)
+
+        btn_apply_acq = QPushButton("Apply")
+        btn_apply_acq.clicked.connect(self.on_apply_kundt_acq)
+        acq_grid.addWidget(btn_apply_acq, 5, 1)
+
 
         self.kundt_fs_spin = compact_spin(QDoubleSpinBox())
         self.kundt_fs_spin.setRange(100.0, 500_000.0)
@@ -448,10 +721,16 @@ class MainWindow(QMainWindow):
         layout.addLayout(params_row)
 
 
-        # ---------------- Action buttons ----------------
+# ---------------- Action buttons (right aligned) ----------------
+        run_row = QHBoxLayout()
+        run_row.addStretch()  # pushes button to the right
+
         self.btn_run_scan = QPushButton("Run Scan")
         self.btn_run_scan.clicked.connect(self.on_run_scan)
-        layout.addWidget(self.btn_run_scan)
+
+        run_row.addWidget(self.btn_run_scan)
+        layout.addLayout(run_row)
+        right_v.addWidget(self.btn_run_scan)
 
 
         # ---------------- Plot + results ----------------
@@ -459,8 +738,11 @@ class MainWindow(QMainWindow):
         self.kundt_canvas.setMinimumHeight(600)
         layout.addWidget(self.kundt_canvas)
 
-        self.scan_result_label = QLabel("Results: -")
-        layout.addWidget(self.scan_result_label)
+        #self.scan_result_label = QLabel("Results: -")
+        #layout.addWidget(self.scan_result_label)
+        btn_show_results = QPushButton("Show Results")
+        btn_show_results.clicked.connect(self.on_show_results)
+        layout.addWidget(btn_show_results)
 
         layout.addStretch()
 
@@ -491,12 +773,29 @@ class MainWindow(QMainWindow):
 
     # ---------------- Slots ----------------
     def on_connect(self):
-        port = self.port_edit.text().strip()
+        port_name = getattr(self, "selected_port", None)
+        if not port_name:
+            QMessageBox.warning(
+                self,
+                "Connection",
+                "No COM port selected.\n\nUse: Connect → Port"
+            )
+            return
+
+        baud = 115200  # <-- set to whatever your MCU uses
+
         try:
-            self.serial_mgr.connect(port, 115200)
-            QMessageBox.information(self, "Connected", f"Connected to {port}.")
-        except Exception as e:
-            QMessageBox.critical(self, "Connection error", str(e))
+            print(f"Connecting to {port_name} @ {baud}...")
+            self.serial_mgr.connect(port_name, baud)
+
+            # Optional: keep for display/logging
+            self.serial_port = port_name
+
+            QMessageBox.information(self, "Connected", f"Connected to {port_name} @ {baud}.")
+        except serial.SerialException as e:
+            self.serial_mgr.disconnect()
+            QMessageBox.critical(self, "Connection failed", f"Could not open {port_name}:\n{e}")
+
 
     def on_disconnect(self):
         self.serial_mgr.disconnect()
@@ -511,6 +810,12 @@ class MainWindow(QMainWindow):
         if not self.ensure_connected(): return
         status, _ = send_command(self.serial_mgr.ser, CMD_SET_DIR, bytes([val]))
         QMessageBox.information(self, "Set DIR", f"Status: {status}")
+    
+    def _motor_velocity_mm_s(self) -> float:
+        # TIM3 clock is 84 MHz with your clock config
+        tim3_clk = 84_000_000.0
+        f_step = tim3_clk / ((self.tim3_psc + 1.0) * (self.tim3_arr + 1.0))  # pulses/s
+        return f_step / float(self.pulses_per_mm)
 
     def on_move_mm(self):
         if not self.ensure_connected(): return
@@ -570,7 +875,60 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+    def on_apply_kundt_acq(self):
+        fs_ui = float(self.kundt_fs_spin.value())
+        n_ui  = int(self.kundt_n_spin.value())
 
+        try:
+            fs_eff = self.mcu_set_sampling_freq(fs_ui)
+        except Exception as e:
+            QMessageBox.warning(self, "Acquisition", f"Failed to set MCU sampling rate:\n{e}")
+            return
+
+        self.FS = fs_eff
+        self.FFT_N = n_ui
+
+        # reflect quantized value
+        self.kundt_fs_spin.blockSignals(True)
+        self.kundt_fs_spin.setValue(fs_eff)
+        self.kundt_fs_spin.blockSignals(False)
+
+        # update label
+        df = fs_eff / max(n_ui, 1)
+        self.lbl_fft_res.setText(f"Δf = {df:.3f} Hz/bin")
+
+    def mcu_set_sampling_freq(self, fs_hz: float) -> float:
+        """
+        Ask MCU to set ADC sampling frequency.
+        Returns the effective sampling frequency reported by MCU (float Hz).
+        """
+        if not self.ensure_connected():
+            raise RuntimeError("Not connected")
+
+        fs_req = int(round(float(fs_hz)))
+        payload = struct.pack("<I", fs_req)  # uint32 little-endian
+
+        status, pl = send_command(self.serial_mgr.ser, CMD_SET_SAMPLING_FREQ, payload)
+
+        if status != STS_ACK or pl is None or len(pl) < 4:
+            raise RuntimeError(f"SET_SAMPLING_FREQ failed (status={status}, payload={pl})")
+
+        fs_eff = struct.unpack("<I", pl[:4])[0]
+        return float(fs_eff)
+    def mcu_get_sampling_freq(self) -> float:
+        """
+        Query MCU for current effective ADC sampling frequency (Hz).
+        """
+        if not self.ensure_connected():
+            raise RuntimeError("Not connected")
+
+        status, pl = send_command(self.serial_mgr.ser, CMD_GET_SAMPLING_FREQ)
+
+        if status != STS_ACK or pl is None or len(pl) < 4:
+            raise RuntimeError(f"GET_SAMPLING_FREQ failed (status={status}, payload={pl})")
+
+        fs_eff = struct.unpack("<I", pl[:4])[0]
+        return float(fs_eff)
     def on_set_freq(self):
         if not self.ensure_connected(): return
         f_hz = float(self.freq_spin.value())
@@ -594,10 +952,30 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Speaker Mute", f"Failed to mute. Status={status}")
     def on_apply_fft_settings(self):
-        self.FS = float(self.fs_spin.value())
-        self.FFT_N = int(self.fft_n_spin.value())
-        QMessageBox.information(self, "FFT Settings",
-                                f"Sampling FS set to {self.FS} Hz\nFFT size N = {self.FFT_N}")
+        fs_ui = float(self.fs_spin.value())
+        n_ui  = int(self.fft_n_spin.value())
+
+        # 1) Push FS to MCU and read back effective FS
+        try:
+            fs_eff = self.mcu_set_sampling_freq(fs_ui)
+        except Exception as e:
+            QMessageBox.warning(self, "FFT Settings", f"Failed to set MCU sampling rate:\n{e}")
+            return
+
+        # 2) Update GUI state with *effective* FS (important: FFT axis must match real sampling)
+        self.FS = fs_eff
+        self.FFT_N = n_ui
+
+        # Update the spinbox to reflect quantization, so user sees the truth
+        self.fs_spin.blockSignals(True)
+        self.fs_spin.setValue(fs_eff)
+        self.fs_spin.blockSignals(False)
+
+        QMessageBox.information(
+            self, "FFT Settings",
+            f"MCU Sampling FS set to {fs_eff:.1f} Hz (requested {fs_ui:.1f} Hz)\n"
+            f"FFT size N = {self.FFT_N}"
+        )
 
     def on_capture_frame(self):
         if not self.ensure_connected(): return
@@ -612,7 +990,6 @@ class MainWindow(QMainWindow):
         self.last_samples = samples
         self._update_time_plot(samples)
         self._update_fft_plot(samples)
-    
     
     def on_live_update(self):
         if not self.live_mode:
@@ -648,7 +1025,6 @@ class MainWindow(QMainWindow):
         self.live_mode = True
         self.live_timer.start(30)   # ~33 FPS oscilloscope
 
-
     def on_stop_live(self):
         if self.live_timer:
             self.live_timer.stop()
@@ -657,7 +1033,6 @@ class MainWindow(QMainWindow):
 
         # Ask STM32 to stop streaming
         send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
-
 
     def on_zoom_in(self):
         self.adc_zoom_factor *= 1.5
@@ -668,7 +1043,6 @@ class MainWindow(QMainWindow):
             self.adc_zoom_center = len(self.last_samples) // 2
             self._update_time_plot(self.last_samples)
 
-
     def on_zoom_out(self):
         self.adc_zoom_factor /= 1.5
         if self.adc_zoom_factor < 1.0:
@@ -676,7 +1050,6 @@ class MainWindow(QMainWindow):
 
         if self.last_samples is not None:
             self._update_time_plot(self.last_samples)
-
 
     def on_zoom_reset(self):
         self.adc_zoom_factor = 1.0
@@ -715,7 +1088,6 @@ class MainWindow(QMainWindow):
 
         for w in self.live_scan_only_widgets:
             w.setVisible(is_live)       # show only in Live Scan
-
 
     def _update_time_plot(self, samples):
         ax = self.time_canvas.ax
@@ -769,7 +1141,6 @@ class MainWindow(QMainWindow):
 
         self.time_canvas.draw()
 
-
     def _update_fft_plot(self, samples):
         ax = self.fft_canvas.ax
         ax.clear()
@@ -811,7 +1182,6 @@ class MainWindow(QMainWindow):
         ax.grid(True)
 
         self.fft_canvas.draw()
-
 
     def on_set_gain(self):
         if not self.ensure_connected(): return
@@ -870,6 +1240,112 @@ class MainWindow(QMainWindow):
 
         return peak_idx, valley_idx
     
+    def _rms_continuous_scan_fast(self, start_mm: float, end_mm: float, window_N: int, hop_N: int):
+        """
+        Continuous RMS scan while motor moves from start_mm to end_mm.
+
+        UPDATED (traditional RMS):
+        - Computes ONE RMS per consecutive block of window_N samples (non-overlapping).
+        - hop_N is ignored (kept only for API compatibility). Effective hop = window_N.
+
+        Position mapping:
+        - Uses the window midpoint sample index normalized to span exactly [start_mm, end_mm].
+        - This avoids reliance on pulses_per_mm for x-axis.
+
+        Returns (positions_mm, rms_vals).
+        """
+        fs = float(self.FS)
+        if fs <= 0:
+            raise RuntimeError("Invalid FS. Ensure MCU sampling frequency is set/read correctly.")
+
+        window_N = int(window_N)
+        if window_N <= 0:
+            raise ValueError("Require window_N > 0")
+
+        # Traditional method: non-overlapping windows
+        hop_eff = window_N  # ignore hop_N for the actual computation
+
+        buf = np.empty(0, dtype=np.uint16)
+        total_received = 0  # total ADC samples received since start of streaming
+
+        mid_samples = []   # window midpoint sample indices (global)
+        rms_vals = []
+
+        # Flush stale packets, start streaming
+        self.serial_mgr.ser.reset_input_buffer()
+        status, _ = send_command(self.serial_mgr.ser, CMD_START_SAMPLING)
+        if status != STS_ACK:
+            raise RuntimeError("Failed to start sampling.")
+
+        # Start move to end (absolute)
+        status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", float(end_mm)))
+        if status != STS_ACK:
+            send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+            raise RuntimeError("Failed to start move to end.")
+
+        # ---- Stream length control (NO framed commands during streaming) ----
+        L_mm = abs(float(end_mm - start_mm))
+        v_mm_s = abs(float(self._motor_velocity_mm_s()))
+        if v_mm_s < 1e-6:
+            T_total = 10.0
+        else:
+            T_move = L_mm / v_mm_s
+            T_total = T_move + 0.30  # margin
+
+        target_samples = int(T_total * fs)
+        # -------------------------------------------------------------------
+
+        try:
+            while total_received < target_samples:
+                # Optional: allow user stop (if you use the toggle logic)
+                if hasattr(self, "scan_running") and not self.scan_running:
+                    break
+
+                # Read one ADC packet
+                _, pkt = read_packet(self.serial_mgr.ser, USB_SAMPLES_PER_PACKET)
+                buf = np.concatenate((buf, pkt))
+                total_received += int(pkt.size)
+
+                # Process as many full windows as available (NON-overlapping)
+                while buf.size >= window_N:
+                    if hasattr(self, "scan_running") and not self.scan_running:
+                        break
+
+                    win = buf[:window_N].astype(np.float64)
+
+                    volts = win * (3.3 / 4096.0)
+                    volts -= np.mean(volts)
+                    rms = float(np.sqrt(np.mean(volts * volts)))
+
+                    # Global sample index of window midpoint
+                    win_start_global = total_received - buf.size
+                    win_mid_global = win_start_global + (window_N // 2)
+
+                    mid_samples.append(win_mid_global)
+                    rms_vals.append(rms)
+
+                    # Discard exactly one window (no overlap)
+                    buf = buf[hop_eff:]
+
+        finally:
+            send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+
+        if len(mid_samples) < 2:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
+        # ---- Map sample indices -> positions so that x spans exactly [start_mm, end_mm] ----
+        mids = np.asarray(mid_samples, dtype=float)
+        y = np.asarray(rms_vals, dtype=float)
+
+        n0 = float(mids[0])
+        n1 = float(mids[-1])
+        den = max(n1 - n0, 1.0)
+
+        alpha = (mids - n0) / den  # 0..1
+        x = float(start_mm) + alpha * (float(end_mm) - float(start_mm))
+
+        return x.astype(float), y.astype(float)
+
     def _measure_metric(self, samples: np.ndarray, mode_id: int, f_hz: float) -> float:
         """
         mode_id: 0 = RMS, 1 = FFT
@@ -892,6 +1368,29 @@ class MainWindow(QMainWindow):
         # FFT magnitude at selected frequency
         mag, _ = fft_mag_at_freq(samples, self.FS, f_hz)
         return float(mag)
+    
+    def _extrema_and_reflection(self, positions: np.ndarray, mags: np.ndarray):
+        positions = np.asarray(positions, dtype=float)
+        mags = np.asarray(mags, dtype=float)
+
+        if len(mags) < 3:
+            raise RuntimeError("Too few points to find extrema.")
+
+        mags_s = mags
+
+        i_max = int(np.argmax(mags_s))
+        i_min = int(np.argmin(mags_s))
+
+        Pmax = float(mags_s[i_max])
+        Pmin = float(mags_s[i_min])
+        x_max = float(positions[i_max])
+        x_min = float(positions[i_min])
+
+        Pmin_safe = max(Pmin, 1e-12)
+        SWR = Pmax / Pmin_safe
+        R_mag = (SWR - 1.0) / (SWR + 1.0)
+
+        return (Pmax, x_max, Pmin, x_min, SWR, R_mag, mags_s)
 
     def _scan_range_metric(self, mode_id: int, f_hz: float, x0: float, x1: float, step_mm: float):
         if step_mm <= 0:
@@ -923,7 +1422,6 @@ class MainWindow(QMainWindow):
             metrics.append(metric)
 
         return np.array(positions, dtype=float), np.array(metrics, dtype=float)
-
 
     def _run_step_scan_metric(
         self,
@@ -1000,17 +1498,37 @@ class MainWindow(QMainWindow):
 
         return np.array(positions, dtype=float), np.array(metrics, dtype=float)
 
+    def on_show_results(self):
+        if not self.last_scan_results:
+            QMessageBox.information(self, "No Results", "No scan results available yet.")
+            return
+
+        if not hasattr(self, "_result_dialog"):
+            self._result_dialog = ScanResultDialog(self)
+
+        self._result_dialog.update_results(self.last_scan_results)
+        self._result_dialog.show()
+        self._result_dialog.raise_()
+        self._result_dialog.activateWindow()
 
     def on_run_scan(self):
         if not self.ensure_connected():
             return
+
+        # Stop live view if running
         if self.live_mode:
             self.on_stop_live()
 
+        # Flush any stale stream bytes
         self.serial_mgr.ser.reset_input_buffer()
 
-        mode_id = self.scan_mode_group.checkedId()  # 0=RMS, 1=FFT
-
+        mode_id = self.scan_mode_group.checkedId()  # 0=RMS step, 2=FFT step, 1=RMS continuous fast
+        if mode_id == 0:
+            mode_name = "RMS"
+        elif mode_id == 1:
+            mode_name = "Fast"
+        elif mode_id == 2:
+                mode_name = "FFT"
         f_hz      = float(self.scan_freq_spin.value())
         start_mm  = float(self.scan_start_spin.value())
         end_mm    = float(self.scan_end_spin.value())
@@ -1019,22 +1537,79 @@ class MainWindow(QMainWindow):
         fine_mm   = float(self.fine_step_spin.value())
         fine_win  = float(self.fine_window_spin.value())
 
+        # --- Always home first (consistent reference) ---
         try:
-            # Home first
             status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
             if status != STS_ACK:
                 raise RuntimeError("Home failed to start.")
             if not wait_until_home_complete(self.serial_mgr.ser):
                 raise RuntimeError("Homing timeout.")
-
-            # Set excitation tone (FFT requires, RMS optional)
+            time.sleep(0.5)
+            # Set excitation tone (FFT requires; RMS optional but usually desired for Kundt tube)
             status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
             if status != STS_ACK:
                 raise RuntimeError("Failed to set tone.")
+            time.sleep(0.5)
+            # ============================================================
+            # MODE 1: RMS Continuous (Fast)
+            # ============================================================
+            if mode_id == 1:
+                # Move to start (absolute) first
+                self._move_abs_mm(start_mm)
+                time.sleep(0.5)
+                winN = int(self.rms_win_spin.value())
+                hopN = int(self.rms_hop_spin.value())
 
-            # --------------------
+                positions, metrics = self._rms_continuous_scan_fast(
+                    start_mm=start_mm,
+                    end_mm=end_mm,
+                    window_N=winN,
+                    hop_N=hopN
+                )
+                if not wait_until_move_complete(self.serial_mgr.ser):
+                    raise RuntimeError("Move timeout in RMS continuous scan.")
+                if positions.size < 2:
+                    raise RuntimeError("Continuous RMS scan produced too few points.")
+
+                # Update results label (RMS continuous doesn't compute SWR/|R| by default)
+                Pmax, x_max, Pmin, x_min, SWR, R_mag, metrics_s = self._extrema_and_reflection(positions, metrics)
+
+                self.last_scan_results = {
+                    "mode": mode_name,
+                    "Pmax": Pmax,
+                    "x_max": x_max,
+                    "Pmin": Pmin,
+                    "x_min": x_min,
+                    "SWR": SWR,
+                    "R": R_mag,
+                    #"points": len(positions)
+                }
+
+
+
+                ax = self.kundt_canvas.ax
+                ax.clear()
+
+                ax.plot(positions, metrics_s, label="RMS Continuous (smoothed)")
+                ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
+                ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
+
+                ax.set_title("Continuous RMS Scan (Fast)")
+                ax.set_xlabel("Position (mm)")
+                ax.set_ylabel("RMS (V)")
+                ax.grid(True)
+                ax.legend()
+                self.kundt_canvas.draw()
+
+
+                return  # done
+
+            # ============================================================
+            # MODE 0: RMS Step  |  MODE 1: FFT Step
+            # (your existing two-stage algorithm)
+            # ============================================================
+            #mode_name = "RMS" if mode_id == 0 else "FFT"
             # 1) COARSE SCAN
-            # --------------------
             coarse_pos, coarse_y = self._scan_range_metric(mode_id, f_hz, start_mm, end_mm, coarse_mm)
 
             i_cmax = int(np.argmax(coarse_y))
@@ -1042,9 +1617,7 @@ class MainWindow(QMainWindow):
             x_cmax = float(coarse_pos[i_cmax])
             x_cmin = float(coarse_pos[i_cmin])
 
-            # --------------------
             # 2) FINE SCAN around max and min
-            # --------------------
             half = fine_win / 2.0
 
             max_x0 = max(start_mm, x_cmax - half)
@@ -1069,73 +1642,124 @@ class MainWindow(QMainWindow):
             SWR = Pmax / Pmin_safe
             R_mag = (SWR - 1.0) / (SWR + 1.0)
 
+            self.last_scan_results = {
+                "mode": mode_name,
+                "Pmax": Pmax,
+                "x_max": x_max,
+                "Pmin": Pmin,
+                "x_min": x_min,
+                "SWR": SWR,
+                "R": R_mag,
+                #"points": len(positions)
+            }
+
+
+            # Plot
+            ax = self.kundt_canvas.ax
+            ax.clear()
+
+            ax.plot(coarse_pos, coarse_y, "k--", label="Coarse")
+            ax.plot(fine_max_pos, fine_max_y, "r-", label="Fine (around max)")
+            ax.plot(fine_min_pos, fine_min_y, "b-", label="Fine (around min)")
+
+            ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
+            ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
+
+            ax.set_title(f"Two-Stage Step Scan ({mode_name})")
+            ax.set_xlabel("Position (mm)")
+            ax.set_ylabel("Metric")
+            ax.grid(True)
+            ax.legend()
+            self.kundt_canvas.draw()
+
         except Exception as e:
             QMessageBox.warning(self, "Scan Error", str(e))
-            self._mute_speaker()
-            return
         finally:
-            # Always mute tone at the end
+            # Always mute at end
+            time.sleep(1)
             self._mute_speaker()
 
-        mode_name = "RMS" if mode_id == 0 else "FFT"
-        self.scan_result_label.setText(
-            f"{mode_name} Two-Stage Scan\n"
-            f"Coarse max≈ {x_cmax:.2f} mm, coarse min≈ {x_cmin:.2f} mm\n"
-            f"Refined Pmax={Pmax:.6g} at {x_max:.2f} mm\n"
-            f"Refined Pmin={Pmin:.6g} at {x_min:.2f} mm\n"
-            f"SWR={SWR:.3f}\n|R|={R_mag:.3f}"
-        )
+def _clamp(x, lo, hi):
+    return max(lo, min(x, hi))
 
-        # --------------------
-        # Plot
-        # --------------------
-        ax = self.kundt_canvas.ax
-        ax.clear()
+def build_scaled_qss(scale: float) -> str:
+    # Scale helper with a sensible lower bound so text never becomes unreadable
+    def px(v: int) -> int:
+        return max(10, int(round(v * scale)))
 
-        ax.plot(coarse_pos, coarse_y, "k--", label="Coarse")
-        ax.plot(fine_max_pos, fine_max_y, "r-", label="Fine (around max)")
-        ax.plot(fine_min_pos, fine_min_y, "b-", label="Fine (around min)")
+    # If you want different baselines for 1080p vs 2K, change the base numbers below.
+    return f"""
+    QWidget {{
+        font-size: {px(18)}px;
+    }}
 
-        ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
-        ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
+    QGroupBox {{
+        font-size: {px(18)}px;
+        font-weight: 600;
+    }}
+    QGroupBox::title {{
+        subcontrol-origin: margin;
+        left: {px(10)}px;
+        padding: 0 {px(6)}px;
+    }}
 
-        ax.set_title(f"Two-Stage Step Scan ({mode_name})")
-        ax.set_xlabel("Position (mm)")
-        ax.set_ylabel("Metric")
-        ax.grid(True)
-        ax.legend()
+    QPushButton {{
+        font-size: {px(20)}px;
+        padding: {px(10)}px {px(14)}px;
+        min-height: {px(38)}px;
+    }}
 
-        self.kundt_canvas.draw()
+    QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {{
+        font-size: {px(20)}px;
+        min-height: {px(38)}px;
+        padding: {px(6)}px {px(10)}px;
+    }}
 
+    QTabWidget::pane {{
+        border-top: 1px solid palette(mid);
+    }}
 
+    QTabBar::tab {{
+        font-size: {px(18)}px;
+        padding: {px(8)}px {px(16)}px;
+        min-height: {px(34)}px;
+    }}
+
+    QLabel {{
+        font-size: {px(18)}px;
+    }}
+    """
+
+def apply_ui_scaling(app: QApplication, baseline_height: int = 1440) -> None:
+    # Use availableGeometry to respect taskbar / dock
+    screen = app.primaryScreen().availableGeometry()
+
+    # Scaling by height is usually more stable across monitors than width
+    scale = screen.height() / float(baseline_height)
+
+    # Clamp: prevent extremes on very small or huge screens
+    # 1080p -> 0.75 when baseline is 1440
+    scale = _clamp(scale, 0.70, 1.25)
+
+    app.setStyleSheet(build_scaled_qss(scale))
 
 def main():
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
+
     app = QApplication(sys.argv)
-    app.setStyleSheet("""
-    QWidget {
-        font-size: 18px;
-    }
-    QPushButton {
-        font-size: 20px;
-        padding: 12px;
-        min-height: 40px;
-    }
-    QLineEdit, QDoubleSpinBox, QSpinBox {
-        font-size: 20px;
-        min-height: 40px;     /* match button height */
-        padding: 6px;         /* improves internal spacing */
-    }
-    QTabBar::tab {
-        font-size: 18px;
-        padding: 10px 20px;
-    }
-""")
+
+    apply_ui_scaling(app, baseline_height=1440)  # baseline = your 2K/1440p look
 
     win = MainWindow()
-    win.resize(2200, 1380)
-    win.show()
-    sys.exit(app.exec_())
 
+    # Size main window relative to screen
+    screen = app.primaryScreen().availableGeometry()
+    win.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
+    #win.move((screen.width() - win.width()) // 2, (screen.height() - win.height()) // 2)
+
+    win.showFullScreen()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()

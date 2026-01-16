@@ -91,7 +91,7 @@ def parse_frame(resp):
 
 _rx_buf = bytearray()
 
-def send_command(ser, cmd, payload=b"", timeout=2.0):
+def send_command(ser, cmd, payload=b"", timeout=3.0):
     # Avoid reset_input_buffer() during scans/streaming; it can desync you.
     ser.write(build_frame(cmd, payload))
     ser.flush()
