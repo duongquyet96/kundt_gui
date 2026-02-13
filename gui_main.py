@@ -16,12 +16,12 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtSerialPort import QSerialPortInfo
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QKeySequence
 
 from commands import *               # FS, command IDs
 from serial_comm import send_command
 from adc_stream import read_adc_frame, read_packet
 from motor_control import wait_until_move_complete, wait_until_home_complete
-from digipot import digipot_set
 from scan_kundt import fft_mag_at_freq
 
 
@@ -129,6 +129,12 @@ class MainWindow(QMainWindow):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.showNormal()
+    def closeEvent(self, event):
+        try:
+            self.serial_mgr.disconnect()
+        except Exception:
+            pass
+        event.accept()
 
     def _refresh_com_ports(self):
             self.port_combo.clear()
@@ -152,6 +158,18 @@ class MainWindow(QMainWindow):
 
         # Example standard menus
         file_menu = menubar.addMenu("File")
+        save_kundt_action = QAction("Save Kundt Scan…", self)
+        save_kundt_action.triggered.connect(self.on_save_kundt_scan)
+
+        exit_action = QAction("Exit", self)
+        exit_action.setShortcut(QKeySequence.Quit)  # Ctrl+Q (Cmd+Q on mac)
+        exit_action.triggered.connect(self.close)   # closes main window -> exits app
+        file_menu.addSeparator()
+
+        file_menu.addAction(save_kundt_action)
+        file_menu.addAction(exit_action)
+
+        
         edit_menu = menubar.addMenu("Edit")
 
         # Connect menu (what you asked for)
@@ -183,6 +201,7 @@ class MainWindow(QMainWindow):
 
         # Initial population
         self._refresh_ports_menu()
+
 
     def _refresh_ports_menu(self):
         self.ports_menu.clear()
@@ -234,47 +253,6 @@ class MainWindow(QMainWindow):
         if act is None:
             return
         self.selected_port = act.data()
-  
-    def _build_menubar(self):
-            menubar = self.menuBar()  # QMainWindow built-in
-
-            # Example standard menus
-            file_menu = menubar.addMenu("File")
-            save_kundt_action = QAction("Save Kundt Scan…", self)
-            save_kundt_action.triggered.connect(self.on_save_kundt_scan)
-
-            file_menu.addAction(save_kundt_action)
-            edit_menu = menubar.addMenu("Edit")
-
-            # Connect menu (what you asked for)
-            connect_menu = menubar.addMenu("Connect")
-
-            # Submenu: Ports
-            self.ports_menu = connect_menu.addMenu("Port")
-
-            # Make ports mutually exclusive (radio behavior)
-            self.port_action_group = QActionGroup(self)
-            self.port_action_group.setExclusive(True)
-
-            # Refresh ports
-            refresh_ports_action = QAction("Refresh Ports", self)
-            refresh_ports_action.triggered.connect(self._refresh_ports_menu)
-            connect_menu.addAction(refresh_ports_action)
-
-            connect_menu.addSeparator()
-
-            # Connect / Disconnect actions
-            self.connect_action = QAction("Connect", self)
-            self.connect_action.triggered.connect(self.on_connect)
-
-            self.disconnect_action = QAction("Disconnect", self)
-            self.disconnect_action.triggered.connect(self.on_disconnect)
-
-            connect_menu.addAction(self.connect_action)
-            connect_menu.addAction(self.disconnect_action)
-
-            # Initial population
-            self._refresh_ports_menu()
 
     def on_save_kundt_scan(self):
         if not hasattr(self, "kundt_canvas"):
@@ -331,7 +309,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_motor_tab(), "Position")
         tabs.addTab(self._build_signal_tab(), "Signal / ADC / FFT")
         tabs.addTab(self._build_kundt_tab(), "Kundt Scan")
-        tabs.addTab(self._build_gain_tab(), "Gain (Digipot)")
+        tabs.addTab(self._build_gain_tab(), "Gain (PGA113)")
+        tabs.addTab(self._build_temp_tab(), "Temperature")
         main_layout.addWidget(tabs)
 
         self.setCentralWidget(central)
@@ -551,8 +530,8 @@ class MainWindow(QMainWindow):
         mode_row_layout = QHBoxLayout(mode_row)
         mode_row_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_mode_rms = QPushButton("RMS Scan")
-        self.btn_mode_rms_cont = QPushButton("RMS Scan Fast")
+        self.btn_mode_rms = QPushButton("RMS Scan1")
+        self.btn_mode_rms_cont = QPushButton("RMS Scan")
         self.btn_mode_fft      = QPushButton("FFT Scan")
         
         for b in (self.btn_mode_rms, self.btn_mode_rms_cont, self.btn_mode_fft):
@@ -565,7 +544,7 @@ class MainWindow(QMainWindow):
         self.scan_mode_group.addButton(self.btn_mode_fft, 2)  # 1 = FFT
         self.btn_mode_fft.setChecked(True)  # default
 
-        mode_row_layout.addWidget(self.btn_mode_rms)
+        #mode_row_layout.addWidget(self.btn_mode_rms)
         mode_row_layout.addWidget(self.btn_mode_rms_cont)
         mode_row_layout.addWidget(self.btn_mode_fft)
 
@@ -596,14 +575,22 @@ class MainWindow(QMainWindow):
         self.scan_freq_spin.setValue(1000.0)
         self.scan_freq_spin.setDecimals(2)
 
+        self.extrema_count_spin = QSpinBox()
+        self.extrema_count_spin.setRange(1, 20)
+        self.extrema_count_spin.setValue(3)  # default: 3 maxima + 3 minima
+
+        basic_grid.addWidget(QLabel("Extrema per type (max & min):"), 3, 0)
+        basic_grid.addWidget(self.extrema_count_spin,              3, 1)
+
+
         self.scan_start_spin = compact_spin(QDoubleSpinBox())
-        self.scan_start_spin.setRange(0.0, 500.0)
-        self.scan_start_spin.setValue(0.0)
+        self.scan_start_spin.setRange(-2.5, 500.0)
+        self.scan_start_spin.setValue(-2.0)
         self.scan_start_spin.setDecimals(2)
 
         self.scan_end_spin = compact_spin(QDoubleSpinBox())
         self.scan_end_spin.setRange(0.0, 900.0)
-        self.scan_end_spin.setValue(250.0)
+        self.scan_end_spin.setValue(0.0)
         self.scan_end_spin.setDecimals(2)
 
         basic_grid.addWidget(QLabel("Frequency (Hz):"), 0, 0)
@@ -634,6 +621,18 @@ class MainWindow(QMainWindow):
 
         acq_grid.addWidget(QLabel("RMS window N:"), 0, 2)
         acq_grid.addWidget(self.rms_win_spin,       0, 3)
+
+        # Spatial phase resolution (deg) for continuous RMS while moving
+        self.rms_phase_deg_spin = QDoubleSpinBox()
+        self.rms_phase_deg_spin.setRange(0.5, 10.0)
+        self.rms_phase_deg_spin.setSingleStep(0.5)
+        self.rms_phase_deg_spin.setDecimals(1)
+        self.rms_phase_deg_spin.setValue(1.0)  # professor default = 1°
+
+        # Add to the same layout as RMS window/hop (adjust row/col as needed)
+        acq_grid.addWidget(QLabel("Spatial phase (deg):"), 1, 3)
+        acq_grid.addWidget(self.rms_phase_deg_spin,       1, 4)
+
 
         btn_apply_acq = QPushButton("Apply")
         btn_apply_acq.clicked.connect(self.on_apply_kundt_acq)
@@ -752,16 +751,38 @@ class MainWindow(QMainWindow):
         w = QWidget()
         layout = QVBoxLayout(w)
 
-        self.gain_spin = QSpinBox()
-        self.gain_spin.setRange(0, 99)
-        self.gain_spin.setValue(50)
-        btn_set_gain = QPushButton("Set Gain (Digipot)")
-        btn_set_gain.clicked.connect(self.on_set_gain)
+        layout.addWidget(QLabel("PGA113 gain:"))
 
-        layout.addWidget(QLabel("Gain setting (0–99):"))
-        layout.addWidget(self.gain_spin)
-        layout.addWidget(btn_set_gain)
+        self.pga_gain_combo = QComboBox()
+        self.pga_gain_combo.addItems(["1x", "2x", "5x", "10x", "20x", "50x", "100x", "200x"])
+        layout.addWidget(self.pga_gain_combo)
+
+        btn_set_pga = QPushButton("Set Gain (PGA113)")
+        btn_set_pga.clicked.connect(self.on_set_pga_gain)
+        layout.addWidget(btn_set_pga)
+
         layout.addStretch()
+        return w
+
+    # ---------------- Temperature tab ----------------
+    def _build_temp_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        self.temp_label = QLabel("Temperature: --.- °C")
+        self.temp_label.setAlignment(Qt.AlignCenter)
+        self.temp_label.setStyleSheet("font-size: 28px; font-weight: 600;")
+
+        btn_temp = QPushButton("Temperature")   # button name exactly “Temperature”
+        btn_temp.setMinimumHeight(80)
+        btn_temp.clicked.connect(self.on_read_temperature)
+
+        layout.addStretch()
+        layout.addWidget(self.temp_label)
+        layout.addSpacing(20)
+        layout.addWidget(btn_temp)
+        layout.addStretch()
+
         return w
 
     # ---------------- Helpers ----------------
@@ -770,6 +791,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Not connected", "Please connect to the serial port first.")
             return False
         return True
+    
+    def mcu_get_temperature_c(self) -> float:
+        """
+        Query MCU for BME280 temperature.
+        Returns temperature in °C (float).
+        """
+        if not self.ensure_connected():
+            raise RuntimeError("Not connected")
+
+        status, pl = send_command(self.serial_mgr.ser, CMD_READ_TEMP)
+
+        if status != STS_ACK or pl is None or len(pl) != 4:
+            raise RuntimeError(f"GET_TEMP failed (status={status}, payload_len={0 if pl is None else len(pl)})")
+
+        return struct.unpack("<f", pl)[0]
 
     # ---------------- Slots ----------------
     def on_connect(self):
@@ -796,10 +832,25 @@ class MainWindow(QMainWindow):
             self.serial_mgr.disconnect()
             QMessageBox.critical(self, "Connection failed", f"Could not open {port_name}:\n{e}")
 
-
     def on_disconnect(self):
         self.serial_mgr.disconnect()
         QMessageBox.information(self, "Disconnected", "Serial port closed.")
+
+    def on_get_temperature(self):
+        if not self.ensure_connected():
+            return
+
+        # Safety: don't send framed commands while ADC streaming
+        if getattr(self, "live_mode", False):
+            QMessageBox.warning(self, "Temperature", "Stop Live View before reading temperature.")
+            return
+
+        try:
+            t = self.mcu_get_temperature_c()  # you add/keep this helper
+            if hasattr(self, "temp_value_label"):
+                self.temp_value_label.setText(f"{t:.2f} °C")
+        except Exception as e:
+            QMessageBox.warning(self, "Temperature", str(e))
 
     def on_toggle_dir(self):
         if not self.ensure_connected(): return
@@ -815,7 +866,7 @@ class MainWindow(QMainWindow):
         # TIM3 clock is 84 MHz with your clock config
         tim3_clk = 84_000_000.0
         f_step = tim3_clk / ((self.tim3_psc + 1.0) * (self.tim3_arr + 1.0))  # pulses/s
-        return f_step / float(self.pulses_per_mm)
+        return (f_step / float(self.pulses_per_mm))/2
 
     def on_move_mm(self):
         if not self.ensure_connected(): return
@@ -929,6 +980,15 @@ class MainWindow(QMainWindow):
 
         fs_eff = struct.unpack("<I", pl[:4])[0]
         return float(fs_eff)
+    def on_read_temperature(self):
+        if not self.ensure_connected():
+            return
+        try:
+            t = self.mcu_get_temperature_c()
+            self.temp_label.setText(f"Temperature: {t:.2f} °C")
+        except Exception as e:
+            QMessageBox.warning(self, "Temperature", str(e))
+
     def on_set_freq(self):
         if not self.ensure_connected(): return
         f_hz = float(self.freq_spin.value())
@@ -1183,10 +1243,35 @@ class MainWindow(QMainWindow):
 
         self.fft_canvas.draw()
 
-    def on_set_gain(self):
-        if not self.ensure_connected(): return
-        v = int(self.gain_spin.value())
-        digipot_set(self.serial_mgr.ser, v)
+    def on_set_pga_gain(self):
+        if not self.ensure_connected():
+            return
+
+        # Safety: don't send framed commands while ADC streaming
+        if getattr(self, "live_mode", False):
+            QMessageBox.warning(self, "PGA113 Gain", "Stop Live View before changing PGA gain.")
+            return
+
+        gain_map = {
+            "1x": 0, "2x": 1, "5x": 2, "10x": 3,
+            "20x": 4, "50x": 5, "100x": 6, "200x": 7,
+        }
+
+        label = self.pga_gain_combo.currentText()
+        gain_code = gain_map[label]
+
+        # CMD_PGA_SET_GAIN must exist in commands.py
+        status, pl = send_command(self.serial_mgr.ser, CMD_PGA_SET, bytes([gain_code]))
+
+        if status == STS_ACK:
+            QMessageBox.information(self, "PGA113 Gain", f"PGA113 gain set to {label}.")
+        else:
+            extra = ""
+            # If MCU returns [gain_code, hal_status] on error, show it
+            if pl and len(pl) >= 2:
+                extra = f"\nReturned: gain_code={pl[0]}, hal_status={pl[1]}"
+            QMessageBox.warning(self, "PGA113 Gain", f"Set failed (status={status}).{extra}")
+
 
     def _mute_speaker(self):
         payload = struct.pack("<f", 0.0)
@@ -1210,60 +1295,327 @@ class MainWindow(QMainWindow):
             return None
         return struct.unpack("<f", payload[:4])[0]
 
-    def find_peaks_and_valleys(self, positions, mags, min_prominence=0.05):
+    def find_peaks_and_valleys(self, positions, mags):
         """
-        Very simple local-extrema finder.
-        min_prominence is fraction of global max to ignore tiny ripples.
-        Returns (peak_indices, valley_indices).
+        Mathematical extrema detection:
+        - Uses derivative sign changes
+        - Enforces strict max/min alternation
+        - No arbitrary mm thresholds
         """
-        if len(mags) < 3:
+
+        x = np.asarray(positions, dtype=float)
+        y = np.asarray(mags, dtype=float)
+
+        if len(y) < 3:
             return [], []
 
-        mags_arr = np.array(mags, dtype=float)
-        max_mag = np.max(mags_arr)
-        if max_mag <= 0:
-            return [], []
+        # Ensure sorted by x
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+        orig_idx = order
+
+        # First derivative (central difference)
+        dy = np.gradient(y, x)
 
         peak_idx = []
         valley_idx = []
 
-        for i in range(1, len(mags_arr) - 1):
-            left = mags_arr[i - 1]
-            mid = mags_arr[i]
-            right = mags_arr[i + 1]
-
-            # relative prominence
-            if mid > left and mid > right and mid > min_prominence * max_mag:
+        # Detect zero-crossings in derivative
+        for i in range(1, len(dy)):
+            if dy[i-1] > 0 and dy[i] <= 0:
                 peak_idx.append(i)
-            if mid < left and mid < right and mid < (1.0 - min_prominence) * max_mag:
+            elif dy[i-1] < 0 and dy[i] >= 0:
                 valley_idx.append(i)
 
+        # ---- Enforce alternation ----
+        extrema = []
+
+        for i in peak_idx:
+            extrema.append(("max", i))
+        for i in valley_idx:
+            extrema.append(("min", i))
+
+        # sort by x-position
+        extrema.sort(key=lambda t: x[t[1]])
+
+        filtered = []
+        last_type = None
+
+        for t, i in extrema:
+            if t == last_type:
+                # keep the stronger one
+                if t == "max":
+                    if y[i] > y[filtered[-1][1]]:
+                        filtered[-1] = (t, i)
+                else:
+                    if y[i] < y[filtered[-1][1]]:
+                        filtered[-1] = (t, i)
+            else:
+                filtered.append((t, i))
+                last_type = t
+
+        # Split back into peaks and valleys
+        peaks = [orig_idx[i] for t, i in filtered if t == "max"]
+        valleys = [orig_idx[i] for t, i in filtered if t == "min"]
+
+        return peaks, valleys
+
+    def find_extrema_standing_wave(
+        self,
+        x,
+        y,
+        f_hz: float,
+        T_c: float,
+        min_sep_frac_lambda: float = 1/8,
+        include_endpoints: bool = False,
+        smooth_frac_lambda: float = 1/20
+    ):
+        """
+        Standing-wave extrema finder (improved):
+
+        - Sorts by x (robust).
+        - Lightly smooths y to suppress ripple noise (window based on wavelength).
+        - Finds extrema via derivative sign changes on the smoothed y.
+        - Refines each extrema by local search on the ORIGINAL y (snaps markers).
+        - Enforces alternation and minimum spacing (~fraction of wavelength).
+        - Returns indices into ORIGINAL (unsorted) arrays.
+        """
+        import numpy as np
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if x.size < 7 or y.size != x.size:
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        # ---- sort by x ----
+        order = np.argsort(x)
+        xs = x[order]
+        ys = y[order]
+
+        # speed of sound and wavelength
+        c = 331.3 + 0.606 * float(T_c)                 # m/s
+        lam_mm = (c / max(float(f_hz), 1e-9)) * 1000.0 # mm
+
+        min_sep_mm = max(1e-6, float(min_sep_frac_lambda) * lam_mm)
+
+        # ---- smoothing window based on wavelength ----
+        # choose a smoothing span ~ lam * smooth_frac_lambda (in mm), convert to samples
+        dx_med = float(np.median(np.diff(xs))) if xs.size > 1 else 1.0
+        smooth_mm = max(dx_med, float(smooth_frac_lambda) * lam_mm)
+        smooth_N = int(round(smooth_mm / max(dx_med, 1e-9)))
+
+        # keep it odd and within sane bounds
+        smooth_N = max(5, min(smooth_N, 101))
+        if smooth_N % 2 == 0:
+            smooth_N += 1
+
+        # simple moving-average smoothing (no scipy needed)
+        if smooth_N >= 5:
+            kernel = np.ones(smooth_N, dtype=float) / float(smooth_N)
+            ys_s = np.convolve(ys, kernel, mode="same")
+        else:
+            ys_s = ys.copy()
+
+        # ---- derivative sign changes on smoothed curve ----
+        dy = np.diff(ys_s)
+        s = np.sign(dy)
+
+        # fill zeros to avoid missing sign changes
+        for i in range(1, s.size):
+            if s[i] == 0:
+                s[i] = s[i - 1]
+        if s.size and s[0] == 0:
+            nz = np.nonzero(s)[0]
+            if nz.size:
+                s[: nz[0] + 1] = s[nz[0]]
+
+        cand_peaks = []
+        cand_valleys = []
+        for i in range(1, s.size):
+            if s[i - 1] > 0 and s[i] < 0:
+                cand_peaks.append(i)
+            elif s[i - 1] < 0 and s[i] > 0:
+                cand_valleys.append(i)
+
+        cand_peaks = np.array(cand_peaks, dtype=int)
+        cand_valleys = np.array(cand_valleys, dtype=int)
+
+        # optional endpoints
+        if include_endpoints and dy.size >= 2:
+            if dy[0] < 0:
+                cand_peaks = np.concatenate(([0], cand_peaks))
+            elif dy[0] > 0:
+                cand_valleys = np.concatenate(([0], cand_valleys))
+
+            if dy[-1] > 0:
+                cand_peaks = np.concatenate((cand_peaks, [xs.size - 1]))
+            elif dy[-1] < 0:
+                cand_valleys = np.concatenate((cand_valleys, [xs.size - 1]))
+
+        # ---- refine candidates: snap to true extrema in ORIGINAL ys within ±refine_N ----
+        # refine span: about 1/16 λ, but at least a few samples
+        refine_mm = max(2.0 * dx_med, (lam_mm / 16.0))
+        refine_N = int(round(refine_mm / max(dx_med, 1e-9)))
+        refine_N = max(3, min(refine_N, 200))
+
+        def refine_idx(i0: int, kind: str) -> int:
+            lo = max(0, i0 - refine_N)
+            hi = min(xs.size, i0 + refine_N + 1)
+            seg = ys[lo:hi]
+            if seg.size == 0:
+                return i0
+            if kind == "peak":
+                j = int(np.argmax(seg))
+            else:
+                j = int(np.argmin(seg))
+            return lo + j
+
+        peaks = [refine_idx(int(i), "peak") for i in cand_peaks]
+        valleys = [refine_idx(int(i), "valley") for i in cand_valleys]
+
+        # ---- merge events, sort, enforce alternation and spacing ----
+        events = []
+        for i in peaks:
+            events.append((xs[i], i, "peak", ys[i]))
+        for i in valleys:
+            events.append((xs[i], i, "valley", ys[i]))
+        events.sort(key=lambda t: t[0])
+
+        if not events:
+            return np.array([], dtype=int), np.array([], dtype=int)
+
+        # alternation: if same type, keep stronger
+        alt = []
+        for ev in events:
+            if not alt:
+                alt.append(ev)
+                continue
+            if ev[2] != alt[-1][2]:
+                alt.append(ev)
+            else:
+                if ev[2] == "peak":
+                    if ev[3] > alt[-1][3]:
+                        alt[-1] = ev
+                else:
+                    if ev[3] < alt[-1][3]:
+                        alt[-1] = ev
+
+        # spacing: if too close, keep stronger
+        filtered = []
+        for ev in alt:
+            if not filtered:
+                filtered.append(ev)
+                continue
+            if (ev[0] - filtered[-1][0]) >= min_sep_mm:
+                filtered.append(ev)
+            else:
+                prev = filtered[-1]
+                if ev[2] == "peak":
+                    if ev[3] > prev[3]:
+                        filtered[-1] = ev
+                else:
+                    if ev[3] < prev[3]:
+                        filtered[-1] = ev
+
+        peak_idx_sorted = np.array([i for _, i, t, _ in filtered if t == "peak"], dtype=int)
+        valley_idx_sorted = np.array([i for _, i, t, _ in filtered if t == "valley"], dtype=int)
+
+        # map back to original indexing
+        peak_idx = order[peak_idx_sorted] if peak_idx_sorted.size else np.array([], dtype=int)
+        valley_idx = order[valley_idx_sorted] if valley_idx_sorted.size else np.array([], dtype=int)
+
         return peak_idx, valley_idx
-    
-    def _rms_continuous_scan_fast(self, start_mm: float, end_mm: float, window_N: int, hop_N: int):
+
+    def _tone_rms_iq(self, x: np.ndarray, fs: float, f0: float) -> float:
+        """
+        Narrowband RMS at f0 using quadrature (no FFT).
+        Returns RMS of the sinusoidal component at f0.
+        """
+        N = len(x)
+        n = np.arange(N, dtype=np.float32)
+        w = 2.0 * np.pi * float(f0) / float(fs)
+
+        c = np.cos(w * n)
+        s = np.sin(w * n)
+
+        # I/Q correlation (acts like narrowband extraction)
+        I = float(np.mean(x * c))
+        Q = float(np.mean(x * s))
+
+        A = 2.0 * np.sqrt(I*I + Q*Q)   # estimate sine amplitude
+        return A / np.sqrt(2.0)        # convert amplitude -> RMS
+
+    def _rms_continuous_scan_fast(
+        self,
+        start_mm: float,
+        end_mm: float,
+        window_N: int,
+        hop_N: int,
+        skip_ms: float = 150.0
+    ):
         """
         Continuous RMS scan while motor moves from start_mm to end_mm.
 
-        UPDATED (traditional RMS):
-        - Computes ONE RMS per consecutive block of window_N samples (non-overlapping).
-        - hop_N is ignored (kept only for API compatibility). Effective hop = window_N.
-
-        Position mapping:
-        - Uses the window midpoint sample index normalized to span exactly [start_mm, end_mm].
-        - This avoids reliance on pulses_per_mm for x-axis.
-
-        Returns (positions_mm, rms_vals).
+        Fix vs. old version:
+        - Spatial mapping uses *measured* start/end positions (CMD_GET_POSITION)
+        instead of assuming the move duration from v_mm_s.
+        - Still avoids framed commands during streaming (USB ADC packets only).
         """
         fs = float(self.FS)
         if fs <= 0:
             raise RuntimeError("Invalid FS. Ensure MCU sampling frequency is set/read correctly.")
 
-        window_N = int(window_N)
-        if window_N <= 0:
+        user_window_N = int(window_N)
+        if user_window_N <= 0:
             raise ValueError("Require window_N > 0")
 
-        # Traditional method: non-overlapping windows
-        hop_eff = window_N  # ignore hop_N for the actual computation
+        user_hop_N = int(hop_N)
+        if user_hop_N <= 0:
+            user_hop_N = user_window_N
+
+        # --- Frequency and motion parameters (needed for window sizing) ---
+        f_hz = float(self.scan_freq_spin.value())  # your current design
+        if f_hz <= 0:
+            raise RuntimeError("Invalid excitation frequency.")
+
+        v_mm_s = abs(float(self._motor_velocity_mm_s()))
+        if v_mm_s < 1e-6:
+            v_mm_s = 20.6  # fallback
+
+        # Temperature-based speed of sound (must be BEFORE streaming)
+        T_c = float(self.mcu_get_temperature_c())
+        self._last_scan_temp_c = float(T_c)  # optional: let caller reuse
+        c_m_s = 331.3 + 0.606 * T_c
+
+        # 1° phase criterion
+        # dx = λ/360, dt_max = dx/v, M_max = fs*dt_max
+        v_m_s = v_mm_s / 1000.0
+        lam_m = c_m_s / float(f_hz)
+        dt_max = lam_m / (360.0 * max(v_m_s, 1e-9))
+        M_max = int(np.floor(fs * dt_max))
+
+        # Use window limited by M_max (but keep a practical minimum)
+        window_N = max(128, min(user_window_N, max(128, M_max)))
+
+        # Hop sanity
+        hop_eff = int(user_hop_N)
+        if hop_eff <= 0 or hop_eff > window_N:
+            hop_eff = window_N
+
+        # Discard startup transient (in samples, based on window midpoint index)
+        skip_samples = int(round((float(skip_ms) / 1000.0) * fs))
+        if skip_samples < 0:
+            skip_samples = 0
+
+        # -------------------------
+        # Measure *actual* start pos
+        # -------------------------
+        # (Framed command is OK here because we're NOT streaming yet)
+        #p0 = self.get_position_mm()
+        #if p0 is None:
+        #    p0 = float(start_mm)
+        #measured_start_mm = float(p0)
 
         buf = np.empty(0, dtype=np.uint16)
         total_received = 0  # total ADC samples received since start of streaming
@@ -1283,57 +1635,84 @@ class MainWindow(QMainWindow):
             send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
             raise RuntimeError("Failed to start move to end.")
 
-        # ---- Stream length control (NO framed commands during streaming) ----
+        # Stream length control: keep your model-based cap, but it is now ONLY a safety net.
         L_mm = abs(float(end_mm - start_mm))
-        v_mm_s = abs(float(self._motor_velocity_mm_s()))
-        if v_mm_s < 1e-6:
-            T_total = 10.0
-        else:
-            T_move = L_mm / v_mm_s
-            T_total = T_move + 0.30  # margin
-
-        target_samples = int(T_total * fs)
-        # -------------------------------------------------------------------
+        T_move_model = L_mm / max(v_mm_s, 1e-9)
+        target_samples = int(T_move_model * fs)  # bigger margin than before
 
         try:
             while total_received < target_samples:
-                # Optional: allow user stop (if you use the toggle logic)
                 if hasattr(self, "scan_running") and not self.scan_running:
                     break
 
                 # Read one ADC packet
                 _, pkt = read_packet(self.serial_mgr.ser, USB_SAMPLES_PER_PACKET)
+                if pkt is None or pkt.size == 0:
+                    continue
+
                 buf = np.concatenate((buf, pkt))
                 total_received += int(pkt.size)
 
-                # Process as many full windows as available (NON-overlapping)
+                # Process as many full windows as available
                 while buf.size >= window_N:
                     if hasattr(self, "scan_running") and not self.scan_running:
                         break
 
-                    win = buf[:window_N].astype(np.float64)
+                    win = buf[:window_N].astype(np.float32)
 
+                    # ADC -> volts, remove DC bias (Vref)
                     volts = win * (3.3 / 4096.0)
-                    volts -= np.mean(volts)
-                    rms = float(np.sqrt(np.mean(volts * volts)))
+                    volts -= float(np.mean(volts))
+
+                    # ---- Narrowband tone RMS at f_hz (quadrature, no FFT) ----
+                    N = volts.size
+                    n = np.arange(N, dtype=np.float32)
+                    w = 2.0 * np.pi * float(f_hz) / float(fs)
+
+                    c = np.cos(w * n)
+                    s = np.sin(w * n)
+
+                    I = float(np.mean(volts * c))
+                    Q = float(np.mean(volts * s))
+
+                    A = 2.0 * np.sqrt(I * I + Q * Q)   # sine amplitude estimate
+                    rms = float(A / np.sqrt(2.0))      # amplitude -> RMS
 
                     # Global sample index of window midpoint
                     win_start_global = total_received - buf.size
                     win_mid_global = win_start_global + (window_N // 2)
 
-                    mid_samples.append(win_mid_global)
-                    rms_vals.append(rms)
+                    # Discard startup transient windows
+                    if win_mid_global >= skip_samples:
+                        mid_samples.append(win_mid_global)
+                        rms_vals.append(rms)
 
-                    # Discard exactly one window (no overlap)
+                    # Advance by hop (allows overlap)
                     buf = buf[hop_eff:]
 
         finally:
+            # Stop streaming FIRST
             send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+            
+
+        # -----------------------
+        # Measure *actual* end pos
+        # -----------------------
+        # (Framed command is OK again because streaming is stopped)
+        #try:
+            #wait_until_move_complete(self.serial_mgr.ser)
+        #except Exception:
+            #pass
+
+        #p1 = self.get_position_mm()
+        #if p1 is None:
+        #    p1 = float(end_mm)
+        #measured_end_mm = float(p1)
 
         if len(mid_samples) < 2:
             return np.array([], dtype=float), np.array([], dtype=float)
 
-        # ---- Map sample indices -> positions so that x spans exactly [start_mm, end_mm] ----
+        # Map sample indices -> positions spanning [measured_start_mm, measured_end_mm]
         mids = np.asarray(mid_samples, dtype=float)
         y = np.asarray(rms_vals, dtype=float)
 
@@ -1341,10 +1720,11 @@ class MainWindow(QMainWindow):
         n1 = float(mids[-1])
         den = max(n1 - n0, 1.0)
 
-        alpha = (mids - n0) / den  # 0..1
-        x = float(start_mm) + alpha * (float(end_mm) - float(start_mm))
+        alpha = (mids - n0) / den
+        #x = measured_start_mm + alpha * (measured_end_mm - measured_start_mm)
+        x = start_mm + alpha * (end_mm - start_mm)
 
-        return x.astype(float), y.astype(float)
+        return np.asarray(x, dtype=float), np.asarray(y, dtype=float)
 
     def _measure_metric(self, samples: np.ndarray, mode_id: int, f_hz: float) -> float:
         """
@@ -1391,6 +1771,93 @@ class MainWindow(QMainWindow):
         R_mag = (SWR - 1.0) / (SWR + 1.0)
 
         return (Pmax, x_max, Pmin, x_min, SWR, R_mag, mags_s)
+
+    def find_all_extrema(
+    self,
+    positions: np.ndarray,
+    values: np.ndarray,
+    min_prom_frac: float = 0.05,
+    min_dx_mm: float = 5.0
+):
+        """
+        Find ALL local maxima/minima with:
+        - min_prom_frac: ignore tiny ripples (fraction of full range)
+        - min_dx_mm: enforce minimum spacing between accepted extrema
+
+        Returns:
+        maxima: list[(x, y)]
+        minima: list[(x, y)]
+        """
+        x = np.asarray(positions, dtype=float)
+        y = np.asarray(values, dtype=float)
+
+        if x.size < 3:
+            return [], []
+
+        # Ensure sorted by position
+        order = np.argsort(x)
+        x = x[order]
+        y = y[order]
+
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+        y_rng = max(y_max - y_min, 1e-12)
+
+        prom_abs = float(min_prom_frac) * y_rng
+        min_dx = float(min_dx_mm)
+
+        # Candidate extrema by neighbor comparison
+        cand_max = []
+        cand_min = []
+        for i in range(1, len(y) - 1):
+            yl, ym, yr = y[i - 1], y[i], y[i + 1]
+
+            # local maximum
+            if ym > yl and ym > yr:
+                # simple prominence proxy vs immediate neighbors
+                prom = ym - max(yl, yr)
+                if prom >= prom_abs:
+                    cand_max.append(i)
+
+            # local minimum
+            if ym < yl and ym < yr:
+                prom = min(yl, yr) - ym
+                if prom >= prom_abs:
+                    cand_min.append(i)
+
+        def _enforce_spacing(idxs, prefer="high"):
+            """Keep extrema separated by min_dx, preferring higher (max) or lower (min)."""
+            if not idxs:
+                return []
+
+            # sort candidates by x
+            idxs = sorted(idxs, key=lambda i: x[i])
+
+            kept = []
+            for i in idxs:
+                if not kept:
+                    kept.append(i)
+                    continue
+
+                if abs(x[i] - x[kept[-1]]) >= min_dx:
+                    kept.append(i)
+                else:
+                    # too close: keep the "better" one
+                    if prefer == "high":
+                        if y[i] > y[kept[-1]]:
+                            kept[-1] = i
+                    else:
+                        if y[i] < y[kept[-1]]:
+                            kept[-1] = i
+
+            return kept
+
+        keep_max = _enforce_spacing(cand_max, prefer="high")
+        keep_min = _enforce_spacing(cand_min, prefer="low")
+
+        maxima = [(float(x[i]), float(y[i])) for i in keep_max]
+        minima = [(float(x[i]), float(y[i])) for i in keep_min]
+        return maxima, minima
 
     def _scan_range_metric(self, mode_id: int, f_hz: float, x0: float, x1: float, step_mm: float):
         if step_mm <= 0:
@@ -1511,6 +1978,121 @@ class MainWindow(QMainWindow):
         self._result_dialog.raise_()
         self._result_dialog.activateWindow()
 
+    def _auto_pga_gain_from_freq(self, f_hz: float) -> str:
+        """
+        Map frequency to PGA113 gain (discrete set).
+        Requirement: 100 Hz -> 1x, 2000 Hz -> 200x.
+        Uses log-log interpolation and snaps to supported gains.
+        """
+        f_min = 100.0
+        f_max = 2000.0
+        g_min = 1.0
+        g_max = 200.0
+
+        f = max(f_min, min(float(f_hz), f_max))
+
+        # log-log interpolation
+        alpha = (np.log10(f) - np.log10(f_min)) / (np.log10(f_max) - np.log10(f_min))
+        g_cont = g_min * (g_max / g_min) ** alpha
+
+        gains = np.array([1, 2, 5, 10, 20, 50, 100, 200], dtype=float)
+        g_sel = gains[np.argmin(np.abs(gains - g_cont))]
+
+        return f"{int(g_sel)}x"
+        
+    def _mcu_set_pga_gain_code(self, gain_code: int, retries: int = 3) -> bool:
+        """
+        Robust PGA set:
+        - ensure streaming is stopped
+        - flush RX
+        - retry a few times to survive framing desync
+        """
+        if not self.ensure_connected():
+            return False
+
+        for _ in range(max(1, int(retries))):
+            try:
+                # Ensure MCU isn't streaming ADC packets
+                send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
+
+                # Flush stale bytes that can corrupt the next framed response
+                self.serial_mgr.ser.reset_input_buffer()
+                time.sleep(0.02)
+
+                status, _ = send_command(self.serial_mgr.ser, CMD_PGA_SET, bytes([int(gain_code) & 0xFF]))
+                if status == STS_ACK:
+                    return True
+
+            except Exception:
+                # If parser throws because of garbage bytes, try again
+                pass
+
+            # small backoff
+            time.sleep(0.05)
+
+        return False
+
+    def _auto_scan_end_from_freq(
+        self,
+        f_hz: float,
+        start_mm: float,
+        extrema_each: int,            # m = number of maxima AND number of minima
+        margin_mm: float = 10.0,
+        min_len_mm: float = 80.0
+    ):
+        """
+        Choose end_mm so we scan enough length to observe approx:
+        extrema_each maxima AND extrema_each minima.
+
+        Adjacent extrema spacing ≈ λ/4, and a sequence of 2m extrema has (2m-1) gaps:
+        L ≈ (2m-1) * (λ/4) + margin
+        If limited by travel (scan_end_spin.maximum()), reduce m accordingly.
+
+        Returns: (end_mm, used_extrema_each, lambda_mm)
+        """
+        if not self.ensure_connected():
+            raise RuntimeError("Not connected")
+        if getattr(self, "live_mode", False):
+            raise RuntimeError("Stop Live View before auto end-mm (needs temperature read).")
+
+        f = max(1.0, float(f_hz))
+        m_req = max(1, int(extrema_each))
+
+        # mandatory temperature from sensor (robust)
+        T_c = float(self.mcu_get_temperature_c())
+
+        # speed of sound and wavelength
+        c = 331.3 + 0.606 * T_c          # m/s
+        lam_mm = (c / f) * 1000.0        # mm
+
+        max_end = float(self.scan_end_spin.maximum())
+
+        # required length for requested m maxima AND m minima
+        desired_len = (2.0 * m_req - 1.0) * (lam_mm / 4.0) + float(margin_mm)
+        desired_len = max(desired_len, float(min_len_mm))
+        end_mm = float(start_mm) + desired_len
+
+        if end_mm > max_end:
+            # available length from start to max end, minus margin
+            avail_len = max(0.0, max_end - float(start_mm) - float(margin_mm))
+
+            # Find max m that fits: (2m-1)*(λ/4) <= avail_len
+            if lam_mm <= 1e-9:
+                m_fit = 1
+            else:
+                m_fit = int(np.floor((2.0 * (avail_len / (lam_mm / 4.0)) + 1.0) / 2.0))
+                m_fit = max(1, m_fit)
+
+            m_use = min(m_req, m_fit)
+
+            desired_len = (2.0 * m_use - 1.0) * (lam_mm / 4.0) + float(margin_mm)
+            desired_len = max(desired_len, float(min_len_mm))
+            end_mm = float(start_mm) + desired_len
+            end_mm = min(end_mm, max_end)
+            return end_mm, int(m_use), float(lam_mm)
+
+        return min(end_mm, max_end), int(m_req), float(lam_mm)
+
     def on_run_scan(self):
         if not self.ensure_connected():
             return
@@ -1528,14 +2110,124 @@ class MainWindow(QMainWindow):
         elif mode_id == 1:
             mode_name = "Fast"
         elif mode_id == 2:
-                mode_name = "FFT"
-        f_hz      = float(self.scan_freq_spin.value())
-        start_mm  = float(self.scan_start_spin.value())
-        end_mm    = float(self.scan_end_spin.value())
+            mode_name = "FFT"
+        else:
+            mode_name = "?"
+
+        f_hz     = float(self.scan_freq_spin.value())
+        start_mm = float(self.scan_start_spin.value())
+
+        # -------------------------------------------------------
+        # AUTO scan end based on extrema count (and travel limit)
+        # -------------------------------------------------------
+        requested_extrema = int(self.extrema_count_spin.value())
+        try:
+            end_mm, used_extrema, lam_mm = self._auto_scan_end_from_freq(
+                f_hz=f_hz,
+                start_mm=start_mm,
+                extrema_each=requested_extrema,
+                margin_mm=10.0,
+                min_len_mm=80.0
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Scan Error", str(e))
+            return
+
+        if used_extrema < requested_extrema:
+            QMessageBox.warning(
+                self,
+                "Scan Range Limited",
+                "Requested scan length exceeds motor travel limit.\n\n"
+                f"Motor limit: {self.scan_end_spin.maximum():.0f} mm\n"
+                f"Frequency: {f_hz:.1f} Hz   λ ≈ {lam_mm:.1f} mm\n\n"
+                f"Reducing extrema target from {requested_extrema} to {used_extrema} "
+                f"(≈ {used_extrema} maxima + {used_extrema} minima)."
+            )
+            self.extrema_count_spin.blockSignals(True)
+            self.extrema_count_spin.setValue(used_extrema)
+            self.extrema_count_spin.blockSignals(False)
+
+        # Show chosen end-mm immediately
+        self.scan_end_spin.blockSignals(True)
+        self.scan_end_spin.setValue(end_mm)
+        self.scan_end_spin.blockSignals(False)
+
+        if mode_id == 1:
+            try:
+                fs = float(self.FS)
+                if fs <= 0:
+                    raise RuntimeError("Invalid FS (sampling rate).")
+
+                if f_hz <= 0:
+                    raise RuntimeError("Invalid excitation frequency.")
+
+                phase_deg = float(self.rms_phase_deg_spin.value())  # NEW user control
+                phase_deg = max(0.1, phase_deg)
+
+                T_c = float(self.mcu_get_temperature_c())
+                c_m_s = 331.3 + 0.606 * T_c
+
+                # Motor speed(mm/s -> m/s)
+                v_mm_s = abs(float(self._motor_velocity_mm_s()))
+                v_m_s = v_mm_s / 1000.0
+                if v_m_s <= 1e-9:
+                    raise RuntimeError("Motor velocity is zero/invalid.")
+
+                M = int(np.floor(fs * c_m_s *phase_deg / (360.0 * v_m_s * float(f_hz))))
+                M = max(128, M)
+                M = min(M, int(self.rms_win_spin.maximum()))
+
+                # Update ONLY the existing RMS Window N spinbox
+                self.rms_win_spin.blockSignals(True)
+                self.rms_win_spin.setValue(M)
+                self.rms_win_spin.blockSignals(False)
+
+                #time window
+                dt_ms = 1000.0 * (M / fs)
+                if hasattr(self, "statusBar"):
+                    try:
+                        self.statusBar().showMessage(
+                            f"Fast RMS window set: N={M} (dt≈{dt_ms:.1f} ms) @ T={T_c:.1f}°C, v={v_mm_s:.1f} mm/s",
+                            5000
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                QMessageBox.warning(self, "Scan Error", f"Failed to set RMS Window N: {e}")
+                return
+
+            QApplication.processEvents()
+
 
         coarse_mm = float(self.coarse_step_spin.value())
         fine_mm   = float(self.fine_step_spin.value())
         fine_win  = float(self.fine_window_spin.value())
+
+        # --- AUTO PGA GAIN BASED ON FREQUENCY ---
+        auto_gain = self._auto_pga_gain_from_freq(f_hz)
+
+        gain_map = {
+            "1x": 0, "2x": 1, "5x": 2, "10x": 3,
+            "20x": 4, "50x": 5, "100x": 6, "200x": 7,
+        }
+        gain_code = gain_map[auto_gain]
+
+        # Update GUI selector (visual feedback)
+        self.pga_gain_combo.blockSignals(True)
+        self.pga_gain_combo.setCurrentText(auto_gain)
+        self.pga_gain_combo.blockSignals(False)
+
+        ok = self._mcu_set_pga_gain_code(gain_code, retries=3)
+        if not ok:
+            QMessageBox.warning(
+                self,
+                "Auto Gain",
+                f"Auto PGA gain set failed (wanted {auto_gain}).\nContinuing with current PGA gain."
+            )
+
+        # Allow analog chain to settle
+        time.sleep(0.05)
 
         # --- Always home first (consistent reference) ---
         try:
@@ -1545,18 +2237,20 @@ class MainWindow(QMainWindow):
             if not wait_until_home_complete(self.serial_mgr.ser):
                 raise RuntimeError("Homing timeout.")
             time.sleep(0.5)
-            # Set excitation tone (FFT requires; RMS optional but usually desired for Kundt tube)
+
+            # Set excitation tone
             status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
             if status != STS_ACK:
                 raise RuntimeError("Failed to set tone.")
             time.sleep(0.5)
+
             # ============================================================
             # MODE 1: RMS Continuous (Fast)
             # ============================================================
             if mode_id == 1:
-                # Move to start (absolute) first
                 self._move_abs_mm(start_mm)
                 time.sleep(0.5)
+
                 winN = int(self.rms_win_spin.value())
                 hopN = int(self.rms_hop_spin.value())
 
@@ -1571,28 +2265,62 @@ class MainWindow(QMainWindow):
                 if positions.size < 2:
                     raise RuntimeError("Continuous RMS scan produced too few points.")
 
-                # Update results label (RMS continuous doesn't compute SWR/|R| by default)
+                # --- Basic global extrema (kept for now; we'll improve averaging later) ---
                 Pmax, x_max, Pmin, x_min, SWR, R_mag, metrics_s = self._extrema_and_reflection(positions, metrics)
+
+                # --- PHYSICALLY CORRECT extrema detection: spacing relative to wavelength ---
+                # Use the temperature already measured earlier for the 1° rule if available,
+                # otherwise fall back to a fresh read (only if NOT streaming now).
+                try:
+                    T_use = float(T_c)  # T_c exists in this mode_id==1 block (used for RMS window rule)
+                except Exception:
+                    T_use = 20.0
+
+                # min_sep_frac_lambda controls how aggressively we reject non-standing-wave ripples.
+                # Typical: 1/8 of lambda is a good compromise; 1/6 is stricter; 1/10 is looser.
+                peak_idx, valley_idx = self.find_extrema_standing_wave(
+                    positions,
+                    metrics_s,
+                    f_hz=f_hz,
+                    T_c=T_use,
+                    min_sep_frac_lambda=1/8,
+                    include_endpoints=False
+                )
+
+                # Store extrema as lists of (x_mm, y) like your previous output format
+                maxima = [(float(positions[i]), float(metrics_s[i])) for i in peak_idx]
+                minima = [(float(positions[i]), float(metrics_s[i])) for i in valley_idx]
 
                 self.last_scan_results = {
                     "mode": mode_name,
-                    "Pmax": Pmax,
-                    "x_max": x_max,
-                    "Pmin": Pmin,
-                    "x_min": x_min,
-                    "SWR": SWR,
-                    "R": R_mag,
-                    #"points": len(positions)
+                    "Pmax": Pmax, "x_max": x_max,
+                    "Pmin": Pmin, "x_min": x_min,
+                    "SWR": SWR, "R": R_mag,
+                    "maxima": maxima,
+                    "minima": minima,
                 }
-
 
 
                 ax = self.kundt_canvas.ax
                 ax.clear()
+                ax.plot(positions, metrics_s, label="RMS Continuous")
 
-                ax.plot(positions, metrics_s, label="RMS Continuous (smoothed)")
-                ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
-                ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
+                # Use the temperature we already read 
+                T_use = float(T_c)
+                peak_idx, valley_idx = self.find_extrema_standing_wave(
+                    positions,
+                    metrics_s,
+                    f_hz=f_hz,
+                    T_c=T_use,
+                    min_sep_frac_lambda=1/8
+                )
+
+                if len(peak_idx) > 0:
+                    ax.scatter(positions[peak_idx], metrics_s[peak_idx],
+                            c="red", s=50, label=f"Maxima ({len(peak_idx)})")
+                if len(valley_idx) > 0:
+                    ax.scatter(positions[valley_idx], metrics_s[valley_idx],
+                            c="blue", s=50, label=f"Minima ({len(valley_idx)})")
 
                 ax.set_title("Continuous RMS Scan (Fast)")
                 ax.set_xlabel("Position (mm)")
@@ -1600,16 +2328,11 @@ class MainWindow(QMainWindow):
                 ax.grid(True)
                 ax.legend()
                 self.kundt_canvas.draw()
-
-
-                return  # done
+                return
 
             # ============================================================
-            # MODE 0: RMS Step  |  MODE 1: FFT Step
-            # (your existing two-stage algorithm)
+            # MODE 0: RMS Step  |  MODE 2: FFT Step
             # ============================================================
-            #mode_name = "RMS" if mode_id == 0 else "FFT"
-            # 1) COARSE SCAN
             coarse_pos, coarse_y = self._scan_range_metric(mode_id, f_hz, start_mm, end_mm, coarse_mm)
 
             i_cmax = int(np.argmax(coarse_y))
@@ -1617,9 +2340,7 @@ class MainWindow(QMainWindow):
             x_cmax = float(coarse_pos[i_cmax])
             x_cmin = float(coarse_pos[i_cmin])
 
-            # 2) FINE SCAN around max and min
             half = fine_win / 2.0
-
             max_x0 = max(start_mm, x_cmax - half)
             max_x1 = min(end_mm,   x_cmax + half)
             min_x0 = max(start_mm, x_cmin - half)
@@ -1628,13 +2349,11 @@ class MainWindow(QMainWindow):
             fine_max_pos, fine_max_y = self._scan_range_metric(mode_id, f_hz, max_x0, max_x1, fine_mm)
             fine_min_pos, fine_min_y = self._scan_range_metric(mode_id, f_hz, min_x0, min_x1, fine_mm)
 
-            # refined extrema from fine scans
             i_fmax = int(np.argmax(fine_max_y))
             i_fmin = int(np.argmin(fine_min_y))
 
             Pmax = float(fine_max_y[i_fmax])
             x_max = float(fine_max_pos[i_fmax])
-
             Pmin = float(fine_min_y[i_fmin])
             x_min = float(fine_min_pos[i_fmin])
 
@@ -1650,21 +2369,15 @@ class MainWindow(QMainWindow):
                 "x_min": x_min,
                 "SWR": SWR,
                 "R": R_mag,
-                #"points": len(positions)
             }
 
-
-            # Plot
             ax = self.kundt_canvas.ax
             ax.clear()
-
             ax.plot(coarse_pos, coarse_y, "k--", label="Coarse")
             ax.plot(fine_max_pos, fine_max_y, "r-", label="Fine (around max)")
             ax.plot(fine_min_pos, fine_min_y, "b-", label="Fine (around min)")
-
             ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
             ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
-
             ax.set_title(f"Two-Stage Step Scan ({mode_name})")
             ax.set_xlabel("Position (mm)")
             ax.set_ylabel("Metric")
@@ -1675,9 +2388,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Scan Error", str(e))
         finally:
-            # Always mute at end
             time.sleep(1)
             self._mute_speaker()
+
+    def set_pga_gain(ser, gain_label: str):
+        gain_code = GAIN_LABEL_TO_CODE[gain_label]
+        send_command(ser, CMD_PGA_SET, bytes([gain_code]))
+
 
 def _clamp(x, lo, hi):
     return max(lo, min(x, hi))
@@ -1752,13 +2469,21 @@ def main():
     apply_ui_scaling(app, baseline_height=1440)  # baseline = your 2K/1440p look
 
     win = MainWindow()
-
+    win.setMinimumSize(800, 600)
     # Size main window relative to screen
     screen = app.primaryScreen().availableGeometry()
-    win.resize(int(screen.width() * 0.90), int(screen.height() * 0.90))
-    #win.move((screen.width() - win.width()) // 2, (screen.height() - win.height()) // 2)
 
-    win.showFullScreen()
+    w = int(screen.width() * 0.90)
+    h = int(screen.height() * 0.90)  # use 90% height instead of 50%
+
+    # Clamp to available screen size (prevents Qt setGeometry warnings)
+    w = min(w, screen.width())
+    h = min(h, screen.height())
+
+    win.resize(w, h)
+
+
+    win.show()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":

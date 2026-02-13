@@ -19,9 +19,10 @@ CMD_STOP_SAMPLING      = 0x51
 CMD_SET_SAMPLING_FREQ  = 0x52
 CMD_GET_SAMPLING_FREQ  = 0x53
 
-CMD_DIGIPOT_SET        = 0x60
-CMD_DIGIPOT_UP         = 0x61
-CMD_DIGIPOT_DOWN       = 0x62
+CMD_PGA_SET            = 0x60
+
+CMD_READ_TEMP          = 0x70
+
 
 AMP_FFT = 0
 AMP_RMS = 1
@@ -38,3 +39,14 @@ SAMPLES_PER_FRAME = 4096
 
 # Sampling rate
 FS = 20000
+
+GAIN_LABEL_TO_CODE = {
+    "1x": 0,
+    "2x": 1,
+    "5x": 2,
+    "10x": 3,
+    "20x": 4,
+    "50x": 5,
+    "100x": 6,
+    "200x": 7,
+}
