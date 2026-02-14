@@ -11,7 +11,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QDialog, QGridLayout, QComboBox,
-    QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QAction, QActionGroup, QMenuBar,
+    QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QAction, QActionGroup, QSizePolicy,
     QGroupBox, QGridLayout, QMessageBox, QTabWidget, QButtonGroup, QAction, QFileDialog, QMessageBox
 )
 from PyQt5.QtSerialPort import QSerialPortInfo
@@ -530,33 +530,34 @@ class MainWindow(QMainWindow):
         mode_row_layout = QHBoxLayout(mode_row)
         mode_row_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.btn_mode_rms = QPushButton("RMS Scan1")
         self.btn_mode_rms_cont = QPushButton("RMS Scan")
         self.btn_mode_fft      = QPushButton("FFT Scan")
-        
-        for b in (self.btn_mode_rms, self.btn_mode_rms_cont, self.btn_mode_fft):
+
+        for b in (self.btn_mode_rms_cont, self.btn_mode_fft):
             b.setCheckable(True)
 
         self.scan_mode_group = QButtonGroup(self)
         self.scan_mode_group.setExclusive(True)
-        self.scan_mode_group.addButton(self.btn_mode_rms, 0)  # 0 = RMS
-        self.scan_mode_group.addButton(self.btn_mode_rms_cont, 1)  # RMS continuous
-        self.scan_mode_group.addButton(self.btn_mode_fft, 2)  # 1 = FFT
+        self.scan_mode_group.addButton(self.btn_mode_rms_cont, 0)  # 0 = RMS
+        self.scan_mode_group.addButton(self.btn_mode_fft,      1)  # 1 = FFT
         self.btn_mode_fft.setChecked(True)  # default
 
-        #mode_row_layout.addWidget(self.btn_mode_rms)
+        # React to mode changes (RMS vs FFT)
+        self.scan_mode_group.buttonClicked[int].connect(self.on_scan_mode_changed)
+
         mode_row_layout.addWidget(self.btn_mode_rms_cont)
         mode_row_layout.addWidget(self.btn_mode_fft)
-
         mode_row_layout.addStretch()
         layout.addWidget(mode_row)
 
         # ---------------- Compact widget helper ----------------
         def compact_spin(spin):
             spin.setFixedHeight(28)
-            spin.setMinimumWidth(150)
+            spin.setFixedWidth(150)   # <-- change from minimum to fixed
+            spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             spin.setStyleSheet("padding: 2px;")
             return spin
+
 
         # ---------------- Two-column parameter row ----------------
         params_row = QHBoxLayout()
@@ -575,13 +576,9 @@ class MainWindow(QMainWindow):
         self.scan_freq_spin.setValue(1000.0)
         self.scan_freq_spin.setDecimals(2)
 
-        self.extrema_count_spin = QSpinBox()
+        self.extrema_count_spin = compact_spin(QDoubleSpinBox())
         self.extrema_count_spin.setRange(1, 20)
         self.extrema_count_spin.setValue(3)  # default: 3 maxima + 3 minima
-
-        basic_grid.addWidget(QLabel("Extrema per type (max & min):"), 3, 0)
-        basic_grid.addWidget(self.extrema_count_spin,              3, 1)
-
 
         self.scan_start_spin = compact_spin(QDoubleSpinBox())
         self.scan_start_spin.setRange(-2.5, 500.0)
@@ -593,73 +590,97 @@ class MainWindow(QMainWindow):
         self.scan_end_spin.setValue(0.0)
         self.scan_end_spin.setDecimals(2)
 
-        basic_grid.addWidget(QLabel("Frequency (Hz):"), 0, 0)
-        basic_grid.addWidget(self.scan_freq_spin,       0, 1)
-        basic_grid.addWidget(QLabel("Start (mm):"),     1, 0)
-        basic_grid.addWidget(self.scan_start_spin,      1, 1)
-        basic_grid.addWidget(QLabel("End (mm):"),       2, 0)
-        basic_grid.addWidget(self.scan_end_spin,        2, 1)
+        basic_grid.addWidget(QLabel("Frequency (Hz):"),               0, 0)
+        basic_grid.addWidget(self.scan_freq_spin,                     0, 1)
+        basic_grid.addWidget(QLabel("Start (mm):"),                   1, 0)
+        basic_grid.addWidget(self.scan_start_spin,                    1, 1)
+        basic_grid.addWidget(QLabel("End (mm):"),                     2, 0)
+        basic_grid.addWidget(self.scan_end_spin,                      2, 1)
+        basic_grid.addWidget(QLabel("Extrema per type (max & min):"), 3, 0)
+        basic_grid.addWidget(self.extrema_count_spin,                 3, 1)
 
         params_row.addWidget(basic_group, 1)
 
-        # ---- Middle: Acquisition (FS, N, FFT resolution) ----
+        # ---- Middle: Acquisition (mode-dependent visibility) ----
+        # Goal:
+        # RMS mode: show FS + RMS window N + spatial phase
+        # FFT mode: show FS + Sample size N + FFT resolution
         acq_group = QGroupBox("Acquisition")
         acq_grid = QGridLayout(acq_group)
         acq_grid.setContentsMargins(8, 8, 8, 8)
         acq_grid.setHorizontalSpacing(10)
         acq_grid.setVerticalSpacing(6)
 
-        self.rms_win_spin = QSpinBox()
-        self.rms_win_spin.setRange(128, 16384)
-        self.rms_win_spin.setSingleStep(128)
-        self.rms_win_spin.setValue(1024)
-
-        self.rms_hop_spin = QSpinBox()
-        self.rms_hop_spin.setRange(64, 16384)
-        self.rms_hop_spin.setSingleStep(64)
-        self.rms_hop_spin.setValue(218)
-
-        acq_grid.addWidget(QLabel("RMS window N:"), 0, 2)
-        acq_grid.addWidget(self.rms_win_spin,       0, 3)
-
-        # Spatial phase resolution (deg) for continuous RMS while moving
-        self.rms_phase_deg_spin = QDoubleSpinBox()
-        self.rms_phase_deg_spin.setRange(0.5, 10.0)
-        self.rms_phase_deg_spin.setSingleStep(0.5)
-        self.rms_phase_deg_spin.setDecimals(1)
-        self.rms_phase_deg_spin.setValue(1.0)  # professor default = 1°
-
-        # Add to the same layout as RMS window/hop (adjust row/col as needed)
-        acq_grid.addWidget(QLabel("Spatial phase (deg):"), 1, 3)
-        acq_grid.addWidget(self.rms_phase_deg_spin,       1, 4)
-
-
-        btn_apply_acq = QPushButton("Apply")
-        btn_apply_acq.clicked.connect(self.on_apply_kundt_acq)
-        acq_grid.addWidget(btn_apply_acq, 5, 1)
-
-
+        # Always visible: Sampling FS
+        self.lbl_kundt_fs = QLabel("Sampling FS (Hz):")
         self.kundt_fs_spin = compact_spin(QDoubleSpinBox())
         self.kundt_fs_spin.setRange(100.0, 500_000.0)
         self.kundt_fs_spin.setDecimals(1)
         self.kundt_fs_spin.setValue(float(getattr(self, "FS", 20000.0)))
 
+        # RMS-only: RMS window N
+        self.lbl_rms_win = QLabel("RMS window N:")
+        self.rms_win_spin = compact_spin(QSpinBox())
+        self.rms_win_spin.setRange(128, 16384)
+        self.rms_win_spin.setSingleStep(128)
+        self.rms_win_spin.setValue(1024)
+
+        # RMS-only: Spatial phase
+        self.lbl_rms_phase = QLabel("Spatial phase (deg):")
+        self.rms_phase_deg_spin = compact_spin(QDoubleSpinBox())
+        self.rms_phase_deg_spin.setRange(0.5, 10.0)
+        self.rms_phase_deg_spin.setSingleStep(0.5)
+        self.rms_phase_deg_spin.setDecimals(1)
+        self.rms_phase_deg_spin.setValue(1.0)
+
+        # Keep hop internal (hidden)
+        self.lbl_rms_hop = QLabel("RMS hop N:")
+        self.rms_hop_spin = QSpinBox()
+        self.rms_hop_spin.setRange(64, 16384)
+        self.rms_hop_spin.setSingleStep(64)
+        self.rms_hop_spin.setValue(218)
+        self.lbl_rms_hop.setVisible(False)
+        self.rms_hop_spin.setVisible(False)
+
+        # FFT-only: Sample size N
+        self.lbl_kundt_n = QLabel("Sample size N:")
         self.kundt_n_spin = compact_spin(QSpinBox())
         self.kundt_n_spin.setRange(256, 16384)
         self.kundt_n_spin.setSingleStep(256)
         self.kundt_n_spin.setValue(int(getattr(self, "FFT_N", 4096)))
 
-        self.lbl_fft_res = QLabel("")  # will be filled by updater
+        # FFT-only: FFT resolution
+        self.lbl_fft_res_title = QLabel("FFT resolution:")
+        self.lbl_fft_res = QLabel("")
 
-        acq_grid.addWidget(QLabel("Sampling FS (Hz):"), 0, 0)
-        acq_grid.addWidget(self.kundt_fs_spin,         0, 1)
-        acq_grid.addWidget(QLabel("Sample size N:"),   1, 0)
-        acq_grid.addWidget(self.kundt_n_spin,          1, 1)
-        acq_grid.addWidget(QLabel("FFT resolution:"),  2, 0)
-        acq_grid.addWidget(self.lbl_fft_res,           2, 1)
+        # Layout (2 columns only; FFT/RMS share row slots, toggled by visibility)
+        acq_grid.addWidget(self.lbl_kundt_fs,      0, 0)
+        acq_grid.addWidget(self.kundt_fs_spin,     0, 1)
+
+        # Row 1: RMS window OR Sample size
+        acq_grid.addWidget(self.lbl_rms_win,       1, 0)
+        acq_grid.addWidget(self.rms_win_spin,      1, 1)
+        acq_grid.addWidget(self.lbl_kundt_n,       1, 0)
+        acq_grid.addWidget(self.kundt_n_spin,      1, 1)
+
+        # Row 2: Spatial phase OR FFT resolution
+        acq_grid.addWidget(self.lbl_rms_phase,     2, 0)
+        acq_grid.addWidget(self.rms_phase_deg_spin,2, 1)
+        acq_grid.addWidget(self.lbl_fft_res_title, 2, 0)
+        acq_grid.addWidget(self.lbl_fft_res,       2, 1)
+
+        # Apply
+        btn_apply_acq = QPushButton("Apply")
+        btn_apply_acq.setFixedHeight(28)
+        btn_apply_acq.setFixedWidth(150)
+        btn_apply_acq.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+        btn_apply_acq.clicked.connect(self.on_apply_kundt_acq)
+        acq_grid.addWidget(btn_apply_acq, 3, 1)
 
         params_row.addWidget(acq_group, 1)
 
+        # FFT resolution updater
         def _update_fft_resolution_label():
             fs = float(self.kundt_fs_spin.value())
             n = int(self.kundt_n_spin.value())
@@ -672,13 +693,22 @@ class MainWindow(QMainWindow):
         self.kundt_n_spin.valueChanged.connect(lambda _=None: _update_fft_resolution_label())
         _update_fft_resolution_label()
 
-        # ---- Right: container that holds Step OR Live group ----
+        # Group widgets for mode-dependent visibility
+        self._acq_rms_widgets = [
+            self.lbl_rms_win, self.rms_win_spin,
+            self.lbl_rms_phase, self.rms_phase_deg_spin,
+        ]
+        self._acq_fft_widgets = [
+            self.lbl_kundt_n, self.kundt_n_spin,
+            self.lbl_fft_res_title, self.lbl_fft_res,
+        ]
+
+        # ---- Right: Step Scan Parameters (FFT-only) ----
         right_container = QWidget()
         right_v = QVBoxLayout(right_container)
         right_v.setContentsMargins(0, 0, 0, 0)
         right_v.setSpacing(0)
 
-        # ---- Step Scan parameters (Step mode only) ----
         step_group = QGroupBox("Step Scan Parameters")
         step_grid = QGridLayout(step_group)
         step_grid.setContentsMargins(8, 8, 8, 8)
@@ -711,41 +741,44 @@ class MainWindow(QMainWindow):
         step_grid.addWidget(self.lbl_finewin,       2, 0)
         step_grid.addWidget(self.fine_window_spin,  2, 1)
 
-        # Put step_group into the right column container
         right_v.addWidget(step_group)
+        self._step_scan_group = step_group  # used by on_scan_mode_changed()
 
-        # Assemble the two columns into the row, then add to main layout
-        params_row.addWidget(basic_group, 1)
         params_row.addWidget(right_container, 1)
         layout.addLayout(params_row)
 
-
-# ---------------- Action buttons (right aligned) ----------------
+        # ---------------- Action buttons (right aligned) ----------------
         run_row = QHBoxLayout()
-        run_row.addStretch()  # pushes button to the right
+        run_row.addStretch()
 
         self.btn_run_scan = QPushButton("Run Scan")
         self.btn_run_scan.clicked.connect(self.on_run_scan)
-
         run_row.addWidget(self.btn_run_scan)
         layout.addLayout(run_row)
-        right_v.addWidget(self.btn_run_scan)
 
+        # Apply initial mode visibility (default is FFT)
+        self.on_scan_mode_changed(int(self.scan_mode_group.checkedId()))
 
         # ---------------- Plot + results ----------------
         self.kundt_canvas = MplCanvas(self, width=5, height=3)
-        self.kundt_canvas.setMinimumHeight(600)
+        #self.kundt_canvas.setMinimumHeight(600)
         layout.addWidget(self.kundt_canvas)
+        layout.setStretchFactor(self.kundt_canvas, 1)
+        #layout.setStretchFactor(btn_show_results, 0)
 
-        #self.scan_result_label = QLabel("Results: -")
-        #layout.addWidget(self.scan_result_label)
         btn_show_results = QPushButton("Show Results")
-        btn_show_results.clicked.connect(self.on_show_results)
-        layout.addWidget(btn_show_results)
+        btn_show_results.clicked.connect(self.on_show_result)
+        layout.addWidget(self.kundt_canvas, 1)  # stretch = 1
 
-        layout.addStretch()
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch()
+        bottom_row.addWidget(btn_show_results)
+        bottom_row.addStretch()
+
+        layout.addLayout(bottom_row)
 
         return w
+
     # ---------------- Gain tab ----------------
     def _build_gain_tab(self):
         w = QWidget()
@@ -1139,15 +1172,27 @@ class MainWindow(QMainWindow):
 
     def on_scan_mode_changed(self, mode_id: int):
         """
-        mode_id: 0 = Live Scan, 1 = Step Scan
+        mode_id: 0 = RMS, 1 = FFT
         """
-        is_live = (mode_id == 0)
+        is_rms = (mode_id == 0)
 
-        for w in self.step_scan_only_widgets:
-            w.setVisible(not is_live)   # show only in Step Scan
+        # Acquisition group: show only the relevant controls
+        if hasattr(self, "_acq_rms_widgets") and hasattr(self, "_acq_fft_widgets"):
+            for w in self._acq_rms_widgets:
+                w.setVisible(is_rms)
+            for w in self._acq_fft_widgets:
+                w.setVisible(not is_rms)
 
-        for w in self.live_scan_only_widgets:
-            w.setVisible(is_live)       # show only in Live Scan
+        # Step scan parameters are only meaningful for FFT step mode
+        if hasattr(self, "_step_scan_group"):
+            self._step_scan_group.setVisible(not is_rms)
+
+        # Keep hop hidden (advanced/internal parameter)
+        if hasattr(self, "lbl_rms_hop"):
+            self.lbl_rms_hop.setVisible(False)
+        if hasattr(self, "rms_hop_spin"):
+            self.rms_hop_spin.setVisible(False)
+        
 
     def _update_time_plot(self, samples):
         ax = self.time_canvas.ax
@@ -1965,18 +2010,126 @@ class MainWindow(QMainWindow):
 
         return np.array(positions, dtype=float), np.array(metrics, dtype=float)
 
-    def on_show_results(self):
-        if not self.last_scan_results:
-            QMessageBox.information(self, "No Results", "No scan results available yet.")
-            return
+    def _refine_extrema_quadratic(self, x, y, idx_list):
+        """
+        Refine extrema positions/values by fitting a quadratic through 3 points
+        around each index i (i-1, i, i+1) and taking the vertex.
 
-        if not hasattr(self, "_result_dialog"):
-            self._result_dialog = ScanResultDialog(self)
+        Works for maxima and minima alike (the vertex gives a stationary point).
+        Handles non-uniform x spacing.
 
-        self._result_dialog.update_results(self.last_scan_results)
-        self._result_dialog.show()
-        self._result_dialog.raise_()
-        self._result_dialog.activateWindow()
+        Returns: list of (x_ref, y_ref) in same order as idx_list.
+        """
+        import numpy as np
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n = len(x)
+        refined = []
+
+        for i in idx_list:
+            i = int(i)
+            if i <= 0 or i >= n - 1:
+                # cannot refine endpoints
+                refined.append((float(x[i]), float(y[i])))
+                continue
+
+            x0, x1, x2 = x[i-1], x[i], x[i+1]
+            y0, y1, y2 = y[i-1], y[i], y[i+1]
+
+            # Fit quadratic y = ax^2 + bx + c through 3 points
+            # (polyfit is robust enough here and handles nonuniform x)
+            try:
+                a, b, c = np.polyfit([x0, x1, x2], [y0, y1, y2], 2)
+            except Exception:
+                refined.append((float(x[i]), float(y[i])))
+                continue
+
+            # If a is ~0, parabola degenerates -> fallback
+            if abs(a) < 1e-18:
+                refined.append((float(x[i]), float(y[i])))
+                continue
+
+            x_v = -b / (2.0 * a)
+
+            # Only accept if inside bracket; otherwise keep sample point
+            lo = min(x0, x2)
+            hi = max(x0, x2)
+            if not (lo <= x_v <= hi):
+                refined.append((float(x[i]), float(y[i])))
+                continue
+
+            y_v = a * x_v * x_v + b * x_v + c
+            refined.append((float(x_v), float(y_v)))
+
+        return refined
+
+
+    def on_show_result(self):
+        try:
+            res = getattr(self, "last_scan_results", None)
+            if not res:
+                QMessageBox.information(self, "Results", "No scan results yet.")
+                return
+
+            # Phase from nearest minimum
+            phi = self._compute_phi_r_from_last_scan()
+            res["dx_min_mm"] = phi["dx_min_mm"]
+            res["phi_r_deg"] = phi["phi_r_deg"]
+            res["T_c"] = phi["T_c"]
+            res["c_m_s"] = phi["c_m_s"]
+            res["wall_mm"] = phi["wall_mm"]
+
+            # Reflection magnitude from scan result
+            R_mag = float(res.get("R", float("nan")))
+            if not np.isfinite(R_mag):
+                raise RuntimeError("Missing |R| in last_scan_results.")
+            R_mag = max(0.0, min(0.999999999, R_mag))  # keep sane numerically
+
+            r_c, Z0, Zw, z_norm, D = self._complex_r_and_impedance(
+                R_mag=R_mag,
+                phi_r_deg=phi["phi_r_deg"],
+                T_c=phi["T_c"]
+            )
+
+            # Store for export/logging
+            res["r_re"] = float(np.real(r_c))
+            res["r_im"] = float(np.imag(r_c))
+            res["Z0"] = float(Z0)
+            res["Zw_re"] = float(np.real(Zw)) if np.isfinite(np.real(Zw)) else float("nan")
+            res["Zw_im"] = float(np.imag(Zw)) if np.isfinite(np.imag(Zw)) else float("nan")
+            res["z_norm_re"] = float(np.real(z_norm)) if np.isfinite(np.real(z_norm)) else float("nan")
+            res["z_norm_im"] = float(np.imag(z_norm)) if np.isfinite(np.imag(z_norm)) else float("nan")
+            res["D"] = float(D)
+
+            # Pretty formatting
+            def cfmt(z: complex, unit: str = "") -> str:
+                if not np.isfinite(np.real(z)) or not np.isfinite(np.imag(z)):
+                    return "undefined"
+                return f"{np.real(z):.4g} {'+' if np.imag(z)>=0 else '-'} j{abs(np.imag(z)):.4g}{unit}"
+
+            txt = (
+                f"Mode: {res.get('mode','?')}\n"
+                f"f: {phi['f_hz']:.1f} Hz\n"
+                f"T: {phi['T_c']:.1f} °C   c: {phi['c_m_s']:.1f} m/s\n"
+                f"Wall position: {phi['wall_mm']:.2f} mm\n\n"
+                f"Pmax: {res.get('Pmax', float('nan')):.6g} @ x={res.get('x_max', float('nan')):.3f} mm\n"
+                f"Pmin: {res.get('Pmin', float('nan')):.6g} @ x={res.get('x_min', float('nan')):.3f} mm\n"
+                f"SWR:  {res.get('SWR', float('nan')):.4g}\n"
+                f"|r|:  {R_mag:.5f}\n\n"
+                f"dx_min (wall→nearest |p| min): {phi['dx_min_mm']:.3f} mm\n"
+                f"phi_r (phase of r): {phi['phi_r_deg']:.2f}°\n\n"
+                f"r = |r|·exp(j·phi_r) = {cfmt(r_c)}\n"
+                f"D = 1 - |r|^2 = {D:.5f}\n\n"
+                f"Z0 = ρ·c ≈ {Z0:.4g} Pa·s/m\n"
+                f"z_w = Zw/Z0 = (1+r)/(1-r) = {cfmt(z_norm)}\n"
+                f"Zw = Z0·z_w = {cfmt(Zw, ' Pa·s/m')}\n"
+            )
+
+            QMessageBox.information(self, "Scan Results", txt)
+
+        except Exception as e:
+            QMessageBox.warning(self, "Result Error", str(e))
 
     def _auto_pga_gain_from_freq(self, f_hz: float) -> str:
         """
@@ -2093,6 +2246,7 @@ class MainWindow(QMainWindow):
 
         return min(end_mm, max_end), int(m_req), float(lam_mm)
 
+
     def on_run_scan(self):
         if not self.ensure_connected():
             return
@@ -2104,15 +2258,11 @@ class MainWindow(QMainWindow):
         # Flush any stale stream bytes
         self.serial_mgr.ser.reset_input_buffer()
 
-        mode_id = self.scan_mode_group.checkedId()  # 0=RMS step, 2=FFT step, 1=RMS continuous fast
-        if mode_id == 0:
-            mode_name = "RMS"
-        elif mode_id == 1:
-            mode_name = "Fast"
-        elif mode_id == 2:
-            mode_name = "FFT"
-        else:
-            mode_name = "?"
+        # New mapping:
+        # 0 = RMS Fast (continuous)
+        # 1 = FFT (step)
+        mode_id = int(self.scan_mode_group.checkedId())
+        mode_name = "Fast RMS" if mode_id == 0 else "FFT" if mode_id == 1 else "?"
 
         f_hz     = float(self.scan_freq_spin.value())
         start_mm = float(self.scan_start_spin.value())
@@ -2152,61 +2302,137 @@ class MainWindow(QMainWindow):
         self.scan_end_spin.setValue(end_mm)
         self.scan_end_spin.blockSignals(False)
 
-        if mode_id == 1:
-            try:
-                fs = float(self.FS)
-                if fs <= 0:
-                    raise RuntimeError("Invalid FS (sampling rate).")
+        # Dispatch to dedicated runner
+        if mode_id == 0:
+            self._run_scan_rms_fast(mode_name, f_hz, start_mm, end_mm)
+        elif mode_id == 1:
+            self._run_scan_fft_step(mode_name, f_hz, start_mm, end_mm)
+        else:
+            QMessageBox.warning(self, "Scan Error", f"Unknown scan mode id: {mode_id}")
 
-                if f_hz <= 0:
-                    raise RuntimeError("Invalid excitation frequency.")
+    def _air_density_kg_m3(self, T_c: float, p_pa: float = 101325.0) -> float:
+        """
+        Simple ideal gas estimate. Good enough for lab Kundt tube reporting.
+        rho = p / (R * T)
+        """
+        T_k = 273.15 + float(T_c)
+        R = 287.05  # J/(kg*K) for dry air
+        return float(p_pa) / (R * T_k)
 
-                phase_deg = float(self.rms_phase_deg_spin.value())  # NEW user control
-                phase_deg = max(0.1, phase_deg)
+    def _complex_r_and_impedance(self, R_mag: float, phi_r_deg: float, T_c: float):
+        """
+        Returns (r_complex, Z0, Zw, z_norm, D)
+        - r_complex: complex
+        - Z0: characteristic impedance rho*c (Pa·s/m)
+        - Zw: wall impedance (Pa·s/m)
+        - z_norm: normalized wall impedance
+        - D: 1 - |r|^2
+        """
+        R_mag = float(R_mag)
+        phi_rad = float(phi_r_deg) * np.pi / 180.0
+        r = R_mag * (np.cos(phi_rad) + 1j * np.sin(phi_rad))
 
-                T_c = float(self.mcu_get_temperature_c())
-                c_m_s = 331.3 + 0.606 * T_c
+        c = self._speed_of_sound_m_s(T_c)
+        rho = self._air_density_kg_m3(T_c)
+        Z0 = rho * c  # Pa·s/m
 
-                # Motor speed(mm/s -> m/s)
-                v_mm_s = abs(float(self._motor_velocity_mm_s()))
-                v_m_s = v_mm_s / 1000.0
-                if v_m_s <= 1e-9:
-                    raise RuntimeError("Motor velocity is zero/invalid.")
+        # Avoid division blow-up if |1-r| ~ 0
+        denom = (1.0 - r)
+        if abs(denom) < 1e-12:
+            Zw = complex("nan")
+            z_norm = complex("nan")
+        else:
+            z_norm = (1.0 + r) / denom
+            Zw = Z0 * z_norm
 
-                M = int(np.floor(fs * c_m_s *phase_deg / (360.0 * v_m_s * float(f_hz))))
-                M = max(128, M)
-                M = min(M, int(self.rms_win_spin.maximum()))
-
-                # Update ONLY the existing RMS Window N spinbox
-                self.rms_win_spin.blockSignals(True)
-                self.rms_win_spin.setValue(M)
-                self.rms_win_spin.blockSignals(False)
-
-                #time window
-                dt_ms = 1000.0 * (M / fs)
-                if hasattr(self, "statusBar"):
-                    try:
-                        self.statusBar().showMessage(
-                            f"Fast RMS window set: N={M} (dt≈{dt_ms:.1f} ms) @ T={T_c:.1f}°C, v={v_mm_s:.1f} mm/s",
-                            5000
-                        )
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                QMessageBox.warning(self, "Scan Error", f"Failed to set RMS Window N: {e}")
-                return
-
-            QApplication.processEvents()
+        D = 1.0 - (R_mag ** 2)
+        return r, Z0, Zw, z_norm, D
 
 
-        coarse_mm = float(self.coarse_step_spin.value())
-        fine_mm   = float(self.fine_step_spin.value())
-        fine_win  = float(self.fine_window_spin.value())
+    def _speed_of_sound_m_s(self, T_c: float) -> float:
+        # Same formula you already use
+        return 331.3 + 0.606 * float(T_c)
 
+    def _wrap_rad_pi(self, a: float) -> float:
+        # wrap to (-pi, pi]
+        return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _phi_r_from_dx_min(self, f_hz: float, T_c: float, dx_min_mm: float) -> float:
+        """
+        Returns phi_r in radians, wrapped to (-pi, pi].
+        phi_r = pi - 2*k*dx_min  (mod 2pi), k=2*pi*f/c
+        """
+        c = self._speed_of_sound_m_s(T_c)
+        k = 2.0 * np.pi * float(f_hz) / float(c)
+
+        dx_m = float(dx_min_mm) / 1000.0
+        phi = np.pi - 2.0 * k * dx_m
+        return self._wrap_rad_pi(phi)
+
+    def _compute_phi_r_from_last_scan(self) -> dict:
+        """
+        Computes dx_min (wall-nearest minimum distance) and phi_r (deg),
+        based on self.last_scan_results and current settings.
+        Returns dict with keys: dx_min_mm, phi_r_deg, T_c, c_m_s
+        """
+        if not getattr(self, "last_scan_results", None):
+            raise RuntimeError("No scan results available.")
+
+        f_hz = float(self.scan_freq_spin.value())
+
+        wall_mm = float(getattr(self, "wall_pos_mm", -2.5))
+
+        # Temperature for c(T)
+        T_c = float(self.mcu_get_temperature_c())
+        c_m_s = self._speed_of_sound_m_s(T_c)
+
+        res = self.last_scan_results
+
+        # Prefer multi-extrema minima if available (FFT and Fast RMS can both have it)
+        dx_candidates = []
+
+        minima = res.get("minima", None)
+        if minima:
+            # minima list items are (x_mm, y)
+            for x_mm, _y in minima:
+                dx = float(x_mm) - wall_mm
+                if dx >= 0:
+                    dx_candidates.append(dx)
+
+        # Fallback to single x_min
+        if not dx_candidates:
+            if "x_min" not in res:
+                raise RuntimeError("No minima info in last_scan_results.")
+            dx = float(res["x_min"]) - wall_mm
+            if dx < 0:
+                # If this happens, your coordinate reference is inconsistent
+                raise RuntimeError(f"x_min={res['x_min']:.3f} mm is before wall at {wall_mm:.3f} mm.")
+            dx_candidates.append(dx)
+
+        dx_min_mm = float(min(dx_candidates))
+
+        phi_r_rad = self._phi_r_from_dx_min(f_hz=f_hz, T_c=T_c, dx_min_mm=dx_min_mm)
+        phi_r_deg = float(phi_r_rad * 180.0 / np.pi)
+
+        return {
+            "dx_min_mm": dx_min_mm,
+            "phi_r_deg": phi_r_deg,
+            "T_c": T_c,
+            "c_m_s": c_m_s,
+            "wall_mm": wall_mm,
+            "f_hz": f_hz,
+        }
+
+
+    def _prepare_scan_common(self, f_hz: float):
+        """
+        Common setup used by both scan modes:
+        - auto PGA gain (freq-based)
+        - home
+        - set excitation frequency
+        """
         # --- AUTO PGA GAIN BASED ON FREQUENCY ---
         auto_gain = self._auto_pga_gain_from_freq(f_hz)
-
         gain_map = {
             "1x": 0, "2x": 1, "5x": 2, "10x": 3,
             "20x": 4, "50x": 5, "100x": 6, "200x": 7,
@@ -2230,159 +2456,302 @@ class MainWindow(QMainWindow):
         time.sleep(0.05)
 
         # --- Always home first (consistent reference) ---
+        status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
+        if status != STS_ACK:
+            raise RuntimeError("Home failed to start.")
+        if not wait_until_home_complete(self.serial_mgr.ser):
+            raise RuntimeError("Homing timeout.")
+        time.sleep(0.5)
+
+        # Set excitation tone
+        status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
+        if status != STS_ACK:
+            raise RuntimeError("Failed to set tone.")
+        time.sleep(0.5)
+
+
+    def _run_scan_rms_fast(self, mode_name: str, f_hz: float, start_mm: float, end_mm: float):
+        """
+        Mode 0: RMS continuous fast (streaming) + sub-sample extrema refinement.
+        """
         try:
-            status, _ = send_command(self.serial_mgr.ser, CMD_HOME)
-            if status != STS_ACK:
-                raise RuntimeError("Home failed to start.")
-            if not wait_until_home_complete(self.serial_mgr.ser):
-                raise RuntimeError("Homing timeout.")
-            time.sleep(0.5)
+            fs = float(self.FS)
+            if fs <= 0:
+                raise RuntimeError("Invalid FS (sampling rate).")
+            if f_hz <= 0:
+                raise RuntimeError("Invalid excitation frequency.")
 
-            # Set excitation tone
-            status, _ = send_command(self.serial_mgr.ser, CMD_AD9833_SINE_FREQ, struct.pack("<f", float(f_hz)))
-            if status != STS_ACK:
-                raise RuntimeError("Failed to set tone.")
-            time.sleep(0.5)
+            phase_deg = float(self.rms_phase_deg_spin.value())
+            phase_deg = max(0.1, phase_deg)
 
-            # ============================================================
-            # MODE 1: RMS Continuous (Fast)
-            # ============================================================
-            if mode_id == 1:
-                self._move_abs_mm(start_mm)
-                time.sleep(0.5)
+            T_c = float(self.mcu_get_temperature_c())
+            c_m_s = 331.3 + 0.606 * T_c
 
-                winN = int(self.rms_win_spin.value())
-                hopN = int(self.rms_hop_spin.value())
+            v_mm_s = abs(float(self._motor_velocity_mm_s()))
+            v_m_s = v_mm_s / 1000.0
+            if v_m_s <= 1e-9:
+                raise RuntimeError("Motor velocity is zero/invalid.")
 
-                positions, metrics = self._rms_continuous_scan_fast(
-                    start_mm=start_mm,
-                    end_mm=end_mm,
-                    window_N=winN,
-                    hop_N=hopN
-                )
-                if not wait_until_move_complete(self.serial_mgr.ser):
-                    raise RuntimeError("Move timeout in RMS continuous scan.")
-                if positions.size < 2:
-                    raise RuntimeError("Continuous RMS scan produced too few points.")
+            M = int(np.floor(fs * c_m_s * phase_deg / (360.0 * v_m_s * float(f_hz))))
+            M = max(128, M)
+            M = min(M, int(self.rms_win_spin.maximum()))
 
-                # --- Basic global extrema (kept for now; we'll improve averaging later) ---
-                Pmax, x_max, Pmin, x_min, SWR, R_mag, metrics_s = self._extrema_and_reflection(positions, metrics)
+            self.rms_win_spin.blockSignals(True)
+            self.rms_win_spin.setValue(M)
+            self.rms_win_spin.blockSignals(False)
 
-                # --- PHYSICALLY CORRECT extrema detection: spacing relative to wavelength ---
-                # Use the temperature already measured earlier for the 1° rule if available,
-                # otherwise fall back to a fresh read (only if NOT streaming now).
+            dt_ms = 1000.0 * (M / fs)
+            if hasattr(self, "statusBar"):
                 try:
-                    T_use = float(T_c)  # T_c exists in this mode_id==1 block (used for RMS window rule)
+                    self.statusBar().showMessage(
+                        f"Fast RMS window set: N={M} (dt≈{dt_ms:.1f} ms) @ T={T_c:.1f}°C, v={v_mm_s:.1f} mm/s",
+                        5000
+                    )
                 except Exception:
-                    T_use = 20.0
+                    pass
 
-                # min_sep_frac_lambda controls how aggressively we reject non-standing-wave ripples.
-                # Typical: 1/8 of lambda is a good compromise; 1/6 is stricter; 1/10 is looser.
-                peak_idx, valley_idx = self.find_extrema_standing_wave(
-                    positions,
-                    metrics_s,
-                    f_hz=f_hz,
-                    T_c=T_use,
-                    min_sep_frac_lambda=1/8,
-                    include_endpoints=False
-                )
+            QApplication.processEvents()
 
-                # Store extrema as lists of (x_mm, y) like your previous output format
-                maxima = [(float(positions[i]), float(metrics_s[i])) for i in peak_idx]
-                minima = [(float(positions[i]), float(metrics_s[i])) for i in valley_idx]
+            # Common prep: gain, home, tone
+            self._prepare_scan_common(f_hz)
 
-                self.last_scan_results = {
-                    "mode": mode_name,
-                    "Pmax": Pmax, "x_max": x_max,
-                    "Pmin": Pmin, "x_min": x_min,
-                    "SWR": SWR, "R": R_mag,
-                    "maxima": maxima,
-                    "minima": minima,
-                }
+            # Move to start and run continuous scan
+            self._move_abs_mm(start_mm)
+            time.sleep(0.5)
 
+            winN = int(self.rms_win_spin.value())
+            hopN = int(self.rms_hop_spin.value())
 
-                ax = self.kundt_canvas.ax
-                ax.clear()
-                ax.plot(positions, metrics_s, label="RMS Continuous")
+            positions, metrics = self._rms_continuous_scan_fast(
+                start_mm=start_mm,
+                end_mm=end_mm,
+                window_N=winN,
+                hop_N=hopN
+            )
 
-                # Use the temperature we already read 
-                T_use = float(T_c)
-                peak_idx, valley_idx = self.find_extrema_standing_wave(
-                    positions,
-                    metrics_s,
-                    f_hz=f_hz,
-                    T_c=T_use,
-                    min_sep_frac_lambda=1/8
-                )
+            if not wait_until_move_complete(self.serial_mgr.ser):
+                raise RuntimeError("Move timeout in RMS continuous scan.")
+            if positions.size < 3:
+                raise RuntimeError("Continuous RMS scan produced too few points (need >=3 for refinement).")
 
-                if len(peak_idx) > 0:
-                    ax.scatter(positions[peak_idx], metrics_s[peak_idx],
-                            c="red", s=50, label=f"Maxima ({len(peak_idx)})")
-                if len(valley_idx) > 0:
-                    ax.scatter(positions[valley_idx], metrics_s[valley_idx],
-                            c="blue", s=50, label=f"Minima ({len(valley_idx)})")
+            # Legacy output (kept) -> gives you metrics_s
+            _Pmax0, _xmax0, _Pmin0, _xmin0, _SWR0, _R0, metrics_s = self._extrema_and_reflection(positions, metrics)
 
-                ax.set_title("Continuous RMS Scan (Fast)")
-                ax.set_xlabel("Position (mm)")
-                ax.set_ylabel("RMS (V)")
-                ax.grid(True)
-                ax.legend()
-                self.kundt_canvas.draw()
-                return
+            # Standing-wave-aware extrema indices on smoothed metric
+            peak_idx, valley_idx = self.find_extrema_standing_wave(
+                positions,
+                metrics_s,
+                f_hz=f_hz,
+                T_c=T_c,
+                min_sep_frac_lambda=1/8,
+                include_endpoints=False
+            )
 
-            # ============================================================
-            # MODE 0: RMS Step  |  MODE 2: FFT Step
-            # ============================================================
-            coarse_pos, coarse_y = self._scan_range_metric(mode_id, f_hz, start_mm, end_mm, coarse_mm)
+            # Quadratic refinement (sub-sample)
+            refined_maxima = self._refine_extrema_quadratic(positions, metrics_s, peak_idx) if len(peak_idx) else []
+            refined_minima = self._refine_extrema_quadratic(positions, metrics_s, valley_idx) if len(valley_idx) else []
 
-            i_cmax = int(np.argmax(coarse_y))
-            i_cmin = int(np.argmin(coarse_y))
-            x_cmax = float(coarse_pos[i_cmax])
-            x_cmin = float(coarse_pos[i_cmin])
+            # Compute global Pmax/Pmin FROM refined sets (this is the key improvement)
+            if refined_maxima:
+                x_max, Pmax = max(refined_maxima, key=lambda t: t[1])
+            else:
+                i = int(np.argmax(metrics_s))
+                x_max, Pmax = float(positions[i]), float(metrics_s[i])
 
-            half = fine_win / 2.0
-            max_x0 = max(start_mm, x_cmax - half)
-            max_x1 = min(end_mm,   x_cmax + half)
-            min_x0 = max(start_mm, x_cmin - half)
-            min_x1 = min(end_mm,   x_cmin + half)
+            if refined_minima:
+                x_min, Pmin = min(refined_minima, key=lambda t: t[1])
+            else:
+                i = int(np.argmin(metrics_s))
+                x_min, Pmin = float(positions[i]), float(metrics_s[i])
 
-            fine_max_pos, fine_max_y = self._scan_range_metric(mode_id, f_hz, max_x0, max_x1, fine_mm)
-            fine_min_pos, fine_min_y = self._scan_range_metric(mode_id, f_hz, min_x0, min_x1, fine_mm)
-
-            i_fmax = int(np.argmax(fine_max_y))
-            i_fmin = int(np.argmin(fine_min_y))
-
-            Pmax = float(fine_max_y[i_fmax])
-            x_max = float(fine_max_pos[i_fmax])
-            Pmin = float(fine_min_y[i_fmin])
-            x_min = float(fine_min_pos[i_fmin])
-
-            Pmin_safe = max(Pmin, 1e-12)
-            SWR = Pmax / Pmin_safe
+            Pmin_safe = max(float(Pmin), 1e-12)
+            SWR = float(Pmax) / Pmin_safe
             R_mag = (SWR - 1.0) / (SWR + 1.0)
 
             self.last_scan_results = {
                 "mode": mode_name,
-                "Pmax": Pmax,
-                "x_max": x_max,
-                "Pmin": Pmin,
-                "x_min": x_min,
-                "SWR": SWR,
-                "R": R_mag,
+                "Pmax": float(Pmax), "x_max": float(x_max),
+                "Pmin": float(Pmin), "x_min": float(x_min),
+                "SWR": float(SWR), "R": float(R_mag),
+                "maxima": [(float(x), float(y)) for (x, y) in refined_maxima],
+                "minima": [(float(x), float(y)) for (x, y) in refined_minima],
             }
 
+            # Plot
             ax = self.kundt_canvas.ax
             ax.clear()
-            ax.plot(coarse_pos, coarse_y, "k--", label="Coarse")
-            ax.plot(fine_max_pos, fine_max_y, "r-", label="Fine (around max)")
-            ax.plot(fine_min_pos, fine_min_y, "b-", label="Fine (around min)")
-            ax.scatter([x_max], [Pmax], c="red", s=80, label="Pmax")
-            ax.scatter([x_min], [Pmin], c="blue", s=80, label="Pmin")
-            ax.set_title(f"Two-Stage Step Scan ({mode_name})")
+            ax.plot(positions, metrics_s, label="RMS Continuous")
+
+            if refined_maxima:
+                ax.scatter([p[0] for p in refined_maxima], [p[1] for p in refined_maxima],
+                        c="red", s=50, label=f"Maxima refined ({len(refined_maxima)})")
+            if refined_minima:
+                ax.scatter([p[0] for p in refined_minima], [p[1] for p in refined_minima],
+                        c="blue", s=50, label=f"Minima refined ({len(refined_minima)})")
+
+            ax.scatter([x_max], [Pmax], c="red", s=120, marker="*", label="Global Pmax")
+            ax.scatter([x_min], [Pmin], c="blue", s=120, marker="*", label="Global Pmin")
+
+            ax.set_title("Continuous RMS Scan (Fast) + refined extrema")
             ax.set_xlabel("Position (mm)")
-            ax.set_ylabel("Metric")
+            ax.set_ylabel("RMS (V)")
             ax.grid(True)
             ax.legend()
+            self.kundt_canvas.draw()
+
+        except Exception as e:
+            QMessageBox.warning(self, "Scan Error", str(e))
+        finally:
+            time.sleep(1)
+            self._mute_speaker()
+
+    def _run_scan_fft_step(self, mode_name: str, f_hz: float, start_mm: float, end_mm: float):
+        """
+        Mode 1: FFT step scan. Fine-scans ALL extrema and applies quadratic sub-step refinement.
+        """
+        try:
+            self._prepare_scan_common(f_hz)
+
+            coarse_mm = float(self.coarse_step_spin.value())
+            fine_mm   = float(self.fine_step_spin.value())
+            fine_win  = float(self.fine_window_spin.value())
+            half = fine_win / 2.0
+
+            FFT_MODE_ID = 2
+
+            try:
+                T_c = float(self.mcu_get_temperature_c())
+            except Exception:
+                T_c = 20.0
+
+            # 1) Coarse scan
+            coarse_pos, coarse_y = self._scan_range_metric(FFT_MODE_ID, f_hz, start_mm, end_mm, coarse_mm)
+            if len(coarse_pos) < 3:
+                raise RuntimeError("FFT coarse scan returned too few points.")
+
+            # 2) All extrema on coarse scan
+            peak_idx, valley_idx = self.find_extrema_standing_wave(
+                coarse_pos,
+                coarse_y,
+                f_hz=f_hz,
+                T_c=T_c,
+                min_sep_frac_lambda=1/8,
+                include_endpoints=False
+            )
+
+            if (len(peak_idx) + len(valley_idx)) == 0:
+                i_cmax = int(np.argmax(coarse_y))
+                i_cmin = int(np.argmin(coarse_y))
+                peak_idx = np.array([i_cmax], dtype=int)
+                valley_idx = np.array([i_cmin], dtype=int)
+
+            refined_maxima = []
+            refined_minima = []
+            fine_traces = []
+
+            # Helper: refine index j within (x_f, y_f)
+            def refine_at_index(x_f, y_f, j):
+                pt = self._refine_extrema_quadratic(x_f, y_f, [int(j)])[0]
+                return (float(pt[0]), float(pt[1]))
+
+            # 3) Fine scan maxima
+            for i in peak_idx:
+                x0 = float(coarse_pos[i])
+                a = max(start_mm, x0 - half)
+                b = min(end_mm,   x0 + half)
+                if b - a < max(fine_mm * 2.0, 1e-6):
+                    continue
+
+                x_f, y_f = self._scan_range_metric(FFT_MODE_ID, f_hz, a, b, fine_mm)
+                if len(x_f) < 3:
+                    continue
+
+                j = int(np.argmax(y_f))
+                refined_maxima.append(refine_at_index(x_f, y_f, j))
+                fine_traces.append((x_f, y_f, f"Fine max @~{x0:.1f}mm"))
+
+            # 4) Fine scan minima
+            for i in valley_idx:
+                x0 = float(coarse_pos[i])
+                a = max(start_mm, x0 - half)
+                b = min(end_mm,   x0 + half)
+                if b - a < max(fine_mm * 2.0, 1e-6):
+                    continue
+
+                x_f, y_f = self._scan_range_metric(FFT_MODE_ID, f_hz, a, b, fine_mm)
+                if len(x_f) < 3:
+                    continue
+
+                j = int(np.argmin(y_f))
+                refined_minima.append(refine_at_index(x_f, y_f, j))
+                fine_traces.append((x_f, y_f, f"Fine min @~{x0:.1f}mm"))
+
+            if (len(refined_maxima) + len(refined_minima)) == 0:
+                raise RuntimeError("FFT fine scan produced no refined extrema (check fine_win / steps).")
+
+            # 5) Global extrema from refined sets
+            if refined_maxima:
+                x_max, Pmax = max(refined_maxima, key=lambda t: t[1])
+            else:
+                i = int(np.argmax(coarse_y))
+                x_max, Pmax = float(coarse_pos[i]), float(coarse_y[i])
+
+            if refined_minima:
+                x_min, Pmin = min(refined_minima, key=lambda t: t[1])
+            else:
+                i = int(np.argmin(coarse_y))
+                x_min, Pmin = float(coarse_pos[i]), float(coarse_y[i])
+
+            Pmin_safe = max(float(Pmin), 1e-12)
+            SWR = float(Pmax) / Pmin_safe
+            R_mag = (SWR - 1.0) / (SWR + 1.0)
+
+            self.last_scan_results = {
+                "mode": mode_name,
+                "Pmax": float(Pmax), "x_max": float(x_max),
+                "Pmin": float(Pmin), "x_min": float(x_min),
+                "SWR": float(SWR), "R": float(R_mag),
+                "maxima": [(float(x), float(y)) for (x, y) in refined_maxima],
+                "minima": [(float(x), float(y)) for (x, y) in refined_minima],
+            }
+
+            # 6) Plot
+            ax = self.kundt_canvas.ax
+            ax.clear()
+            ax.plot(coarse_pos, coarse_y, "k--", label="Coarse (FFT metric)")
+
+            for (x_f, y_f, lbl) in fine_traces:
+                ax.plot(x_f, y_f, "-", linewidth=1.0, alpha=0.7, label=lbl)
+
+            if refined_maxima:
+                xm = np.array([p[0] for p in refined_maxima], dtype=float)
+                ym = np.array([p[1] for p in refined_maxima], dtype=float)
+                ax.scatter(xm, ym, c="red", s=50, label=f"Refined maxima ({len(refined_maxima)})")
+
+            if refined_minima:
+                xn = np.array([p[0] for p in refined_minima], dtype=float)
+                yn = np.array([p[1] for p in refined_minima], dtype=float)
+                ax.scatter(xn, yn, c="blue", s=50, label=f"Refined minima ({len(refined_minima)})")
+
+            ax.scatter([x_max], [Pmax], c="red", s=120, marker="*", label="Global Pmax")
+            ax.scatter([x_min], [Pmin], c="blue", s=120, marker="*", label="Global Pmin")
+
+            ax.set_title("FFT Scan: Coarse + Fine (all extrema) + refined peaks")
+            ax.set_xlabel("Position (mm)")
+            ax.set_ylabel("Metric (FFT)")
+            ax.grid(True)
+
+            # Legend dedup
+            handles, labels = ax.get_legend_handles_labels()
+            seen = set()
+            h2, l2 = [], []
+            for h, l in zip(handles, labels):
+                if l not in seen:
+                    seen.add(l)
+                    h2.append(h)
+                    l2.append(l)
+            ax.legend(h2, l2)
+
             self.kundt_canvas.draw()
 
         except Exception as e:
