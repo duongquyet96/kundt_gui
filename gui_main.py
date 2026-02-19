@@ -1417,17 +1417,15 @@ class MainWindow(QMainWindow):
         smooth_frac_lambda: float = 1/20
     ):
         """
-        Standing-wave extrema finder (improved):
+        Standing-wave extrema finder:
 
-        - Sorts by x (robust).
-        - Lightly smooths y to suppress ripple noise (window based on wavelength).
-        - Finds extrema via derivative sign changes on the smoothed y.
-        - Refines each extrema by local search on the ORIGINAL y (snaps markers).
-        - Enforces alternation and minimum spacing (~fraction of wavelength).
-        - Returns indices into ORIGINAL (unsorted) arrays.
+        - Sorts by x.
+        - Lightly smooths y .
+        - Finds extrema via sign changes.
+        - Refines each extrema by local search on the ORIGINAL y.
+        - Enforces alternation and minimum spacing.
+        - Returns indices into original arrays.
         """
-        import numpy as np
-
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
         if x.size < 7 or y.size != x.size:
@@ -1601,11 +1599,7 @@ class MainWindow(QMainWindow):
     ):
         """
         Continuous RMS scan while motor moves from start_mm to end_mm.
-
-        Fix vs. old version:
-        - Spatial mapping uses *measured* start/end positions (CMD_GET_POSITION)
-        instead of assuming the move duration from v_mm_s.
-        - Still avoids framed commands during streaming (USB ADC packets only).
+        Return an array of x and its y values.
         """
         fs = float(self.FS)
         if fs <= 0:
@@ -1619,42 +1613,42 @@ class MainWindow(QMainWindow):
         if user_hop_N <= 0:
             user_hop_N = user_window_N
 
-        # --- Frequency and motion parameters (needed for window sizing) ---
-        f_hz = float(self.scan_freq_spin.value())  # your current design
+        # --- Frequency and motion parameters  ---
+        f_hz = float(self.scan_freq_spin.value())
         if f_hz <= 0:
             raise RuntimeError("Invalid excitation frequency.")
 
-        v_mm_s = abs(float(self._motor_velocity_mm_s()))
+        v_mm_s = abs(float(self._motor_velocity_mm_s())) # Berechnung der Geschwindigkeit
         if v_mm_s < 1e-6:
             v_mm_s = 20.6  # fallback
 
-        # Temperature-based speed of sound (must be BEFORE streaming)
+        # Temperaturmessung
         T_c = float(self.mcu_get_temperature_c())
         self._last_scan_temp_c = float(T_c)  # optional: let caller reuse
-        c_m_s = 331.3 + 0.606 * T_c
+        c_m_s = 331.3 + 0.606 * T_c #Schallgeschwindikeit
 
-        # 1° phase criterion
+        # 1° Ortauflösung
         # dx = λ/360, dt_max = dx/v, M_max = fs*dt_max
         v_m_s = v_mm_s / 1000.0
         lam_m = c_m_s / float(f_hz)
         dt_max = lam_m / (360.0 * max(v_m_s, 1e-9))
         M_max = int(np.floor(fs * dt_max))
 
-        # Use window limited by M_max (but keep a practical minimum)
+        # Maximale Fensterbreit (minimum 128)
         window_N = max(128, min(user_window_N, max(128, M_max)))
 
-        # Hop sanity
+        # dieser Wert wird nicht benutzt, Artefakt aus alter Software
         hop_eff = int(user_hop_N)
         if hop_eff <= 0 or hop_eff > window_N:
             hop_eff = window_N
 
-        # Discard startup transient (in samples, based on window midpoint index)
+        # Sample überspringen wegen Einschwingsverhalten
         skip_samples = int(round((float(skip_ms) / 1000.0) * fs))
         if skip_samples < 0:
             skip_samples = 0
 
         # -------------------------
-        # Measure *actual* start pos
+        # Measure *actual* start pos, nicht mehr verwendet
         # -------------------------
         # (Framed command is OK here because we're NOT streaming yet)
         #p0 = self.get_position_mm()
@@ -1674,13 +1668,13 @@ class MainWindow(QMainWindow):
         if status != STS_ACK:
             raise RuntimeError("Failed to start sampling.")
 
-        # Start move to end (absolute)
+        # Start move to end
         status, _ = send_command(self.serial_mgr.ser, CMD_STEPPER_MOVE, struct.pack("<f", float(end_mm)))
         if status != STS_ACK:
             send_command(self.serial_mgr.ser, CMD_STOP_SAMPLING)
             raise RuntimeError("Failed to start move to end.")
 
-        # Stream length control: keep your model-based cap, but it is now ONLY a safety net.
+        # Stream length control
         L_mm = abs(float(end_mm - start_mm))
         T_move_model = L_mm / max(v_mm_s, 1e-9)
         target_samples = int(T_move_model * fs)  # bigger margin than before
@@ -1708,7 +1702,8 @@ class MainWindow(QMainWindow):
                     # ADC -> volts, remove DC bias (Vref)
                     volts = win * (3.3 / 4096.0)
                     volts -= float(np.mean(volts))
-
+                    """ IQ Methode für eine bessere Amplitude-Detektion, 
+                        aber ich benutze lieber Pure-RMS damit der Vergleich zwischen RMS und FFT deutlicher wird
                     # ---- Narrowband tone RMS at f_hz (quadrature, no FFT) ----
                     N = volts.size
                     n = np.arange(N, dtype=np.float32)
@@ -1722,6 +1717,8 @@ class MainWindow(QMainWindow):
 
                     A = 2.0 * np.sqrt(I * I + Q * Q)   # sine amplitude estimate
                     rms = float(A / np.sqrt(2.0))      # amplitude -> RMS
+                    """
+                    rms = float(np.sqrt(np.mean(volts * volts))) # RMS berechnung
 
                     # Global sample index of window midpoint
                     win_start_global = total_received - buf.size
@@ -2014,14 +2011,8 @@ class MainWindow(QMainWindow):
         """
         Refine extrema positions/values by fitting a quadratic through 3 points
         around each index i (i-1, i, i+1) and taking the vertex.
-
-        Works for maxima and minima alike (the vertex gives a stationary point).
-        Handles non-uniform x spacing.
-
         Returns: list of (x_ref, y_ref) in same order as idx_list.
         """
-        import numpy as np
-
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
         n = len(x)
@@ -2121,9 +2112,9 @@ class MainWindow(QMainWindow):
                 f"phi_r (phase of r): {phi['phi_r_deg']:.2f}°\n\n"
                 f"r = |r|·exp(j·phi_r) = {cfmt(r_c)}\n"
                 f"D = 1 - |r|^2 = {D:.5f}\n\n"
-                f"Z0 = ρ·c ≈ {Z0:.4g} Pa·s/m\n"
-                f"z_w = Zw/Z0 = (1+r)/(1-r) = {cfmt(z_norm)}\n"
-                f"Zw = Z0·z_w = {cfmt(Zw, ' Pa·s/m')}\n"
+                #f"Z0 = ρ·c ≈ {Z0:.4g} Pa·s/m\n"
+                #f"z_w = Zw/Z0 = (1+r)/(1-r) = {cfmt(z_norm)}\n"
+                #f"Zw = Z0·z_w = {cfmt(Zw, ' Pa·s/m')}\n"
             )
 
             QMessageBox.information(self, "Scan Results", txt)
@@ -2211,10 +2202,10 @@ class MainWindow(QMainWindow):
         f = max(1.0, float(f_hz))
         m_req = max(1, int(extrema_each))
 
-        # mandatory temperature from sensor (robust)
+        #temperature from sensor (robust)
         T_c = float(self.mcu_get_temperature_c())
 
-        # speed of sound and wavelength
+        #speed of sound and wavelength
         c = 331.3 + 0.606 * T_c          # m/s
         lam_mm = (c / f) * 1000.0        # mm
 
@@ -2258,7 +2249,6 @@ class MainWindow(QMainWindow):
         # Flush any stale stream bytes
         self.serial_mgr.ser.reset_input_buffer()
 
-        # New mapping:
         # 0 = RMS Fast (continuous)
         # 1 = FFT (step)
         mode_id = int(self.scan_mode_group.checkedId())
@@ -2312,7 +2302,7 @@ class MainWindow(QMainWindow):
 
     def _air_density_kg_m3(self, T_c: float, p_pa: float = 101325.0) -> float:
         """
-        Simple ideal gas estimate. Good enough for lab Kundt tube reporting.
+        Simple ideal gas estimate. 
         rho = p / (R * T)
         """
         T_k = 273.15 + float(T_c)
@@ -2380,7 +2370,7 @@ class MainWindow(QMainWindow):
 
         f_hz = float(self.scan_freq_spin.value())
 
-        wall_mm = float(getattr(self, "wall_pos_mm", -2.5))
+        wall_mm = float(getattr(self, "wall_pos_mm", -2.0))
 
         # Temperature for c(T)
         T_c = float(self.mcu_get_temperature_c())
@@ -2473,6 +2463,7 @@ class MainWindow(QMainWindow):
     def _run_scan_rms_fast(self, mode_name: str, f_hz: float, start_mm: float, end_mm: float):
         """
         Mode 0: RMS continuous fast (streaming) + sub-sample extrema refinement.
+        Prepare all variables needed for rms-scan
         """
         try:
             fs = float(self.FS)
@@ -2484,14 +2475,17 @@ class MainWindow(QMainWindow):
             phase_deg = float(self.rms_phase_deg_spin.value())
             phase_deg = max(0.1, phase_deg)
 
-            T_c = float(self.mcu_get_temperature_c())
-            c_m_s = 331.3 + 0.606 * T_c
+            T_c = float(self.mcu_get_temperature_c())   # Temperaturmessung
+            c_m_s = 331.3 + 0.606 * T_c                 #Schallgeschwindigkeit
 
-            v_mm_s = abs(float(self._motor_velocity_mm_s()))
+            v_mm_s = abs(float(self._motor_velocity_mm_s())) #Motorgeschwindigkeit
             v_m_s = v_mm_s / 1000.0
             if v_m_s <= 1e-9:
                 raise RuntimeError("Motor velocity is zero/invalid.")
-
+            
+            """
+            Berechnung der Fensterbreite und zeigt diese auf der Benutzeroberfläche
+            """
             M = int(np.floor(fs * c_m_s * phase_deg / (360.0 * v_m_s * float(f_hz))))
             M = max(128, M)
             M = min(M, int(self.rms_win_spin.maximum()))
@@ -2534,7 +2528,7 @@ class MainWindow(QMainWindow):
             if positions.size < 3:
                 raise RuntimeError("Continuous RMS scan produced too few points (need >=3 for refinement).")
 
-            # Legacy output (kept) -> gives you metrics_s
+            # Alter Code, wird nicht verwendet
             _Pmax0, _xmax0, _Pmin0, _xmin0, _SWR0, _R0, metrics_s = self._extrema_and_reflection(positions, metrics)
 
             # Standing-wave-aware extrema indices on smoothed metric
@@ -2551,7 +2545,7 @@ class MainWindow(QMainWindow):
             refined_maxima = self._refine_extrema_quadratic(positions, metrics_s, peak_idx) if len(peak_idx) else []
             refined_minima = self._refine_extrema_quadratic(positions, metrics_s, valley_idx) if len(valley_idx) else []
 
-            # Compute global Pmax/Pmin FROM refined sets (this is the key improvement)
+            # Compute global Pmax/Pmin FROM refined sets
             if refined_maxima:
                 x_max, Pmax = max(refined_maxima, key=lambda t: t[1])
             else:
